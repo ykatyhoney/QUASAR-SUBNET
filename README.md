@@ -15,6 +15,7 @@
 - [Architecture](#architecture)
   - [Validator API](#validator-api)
   - [Miner Neuron](#miner-neuron)
+    - [BYOC Mode (Bring Your Own Code)](#byoc-mode-bring-your-own-code)
   - [Validator Neuron](#validator-neuron)
   - [Miner Inference Server](#miner-inference-server)
 - [Quick Start](#quick-start)
@@ -24,6 +25,7 @@
 - [Testing Guide](#testing-guide)
 - [Docker & Image Publishing](#docker--image-publishing)
 - [Key Environment Variables](#key-environment-variables)
+- [Required Imports (Critical!)](#required-imports-critical)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -105,6 +107,69 @@ python -m neurons.miner \
 ```
 
 > **Note**: The miner requires `GITHUB_TOKEN` (with `repo` scope) and `GITHUB_USERNAME` in `.env`.
+
+#### BYOC Mode (Bring Your Own Code)
+
+If you already have an optimized kernel implementation, you can use **BYOC mode** to feed it directly to the miner instead of relying on the LLM to generate one from scratch. This is useful when:
+
+- You have a hand-optimized CUDA kernel
+- You want to use an existing optimized implementation as a reference
+- You want to improve upon an existing optimization
+
+**Usage**:
+
+1. **Set the BYOC file path** in `.env`:
+   ```bash
+   BYOC_FILE_PATH=./path/to/your/optimized/chunk.py
+   ./START_MINER.sh
+   ```
+
+2. **Or export it before running** the startup script:
+   ```bash
+   export BYOC_FILE_PATH=./path/to/your/optimized/chunk.py
+   ./START_MINER.sh
+   ```
+
+3. **Or use command line arguments directly** (bypassing the startup script):
+   ```bash
+   python -m neurons.miner \
+     --wallet.name "$WALLET_MINER_NAME" \
+     --wallet.hotkey "$WALLET_HOTKEY" \
+     --subtensor.network "$SUBTENSOR_NETWORK" \
+     --netuid "$NETUID" \
+     --byoc-file ./path/to/your/optimized/chunk.py
+   ```
+
+**How it works**:
+
+- The miner will use your provided code as an **expert reference** during code generation
+- The LLM will adapt your code to match the repository structure and requirements
+- Your code's implementation approach will guide the optimization process
+- The miner will still ensure all required imports are included and the code matches the expected signatures
+
+**Tips**:
+
+- Start with a smaller target sequence length first (e.g., `TARGET_SEQUENCE_LENGTH=100000`) - 100k is easier to optimize for
+- Make sure your BYOC file includes all required imports (see [Required Imports](#required-imports-critical) below)
+- The file should be a valid Python file that can be imported and tested
+
+**Example**:
+
+```bash
+# Using environment variable
+export BYOC_FILE_PATH=./my_optimized_kernels/chunk.py
+export TARGET_SEQUENCE_LENGTH=100000
+./START_MINER.sh
+
+# Or using command line argument
+python -m neurons.miner \
+  --wallet.name "$WALLET_MINER_NAME" \
+  --wallet.hotkey "$WALLET_HOTKEY" \
+  --subtensor.network "$SUBTENSOR_NETWORK" \
+  --netuid "$NETUID" \
+  --byoc-file ./my_optimized_kernels/chunk.py \
+  --target-seq-len 100000
+```
 
 ### Validator Neuron
 
@@ -353,6 +418,24 @@ Defined in `.env`:
 | `BLOCKS_UNTIL_REVEAL`   | `100`                                         | Commit–reveal           |
 | `BLOCK_TIME_SECONDS`    | `12`                                          | Commit–reveal           |
 | `DOCKER_USERNAME`       | `dokerhub_username`                                 | Bazel / oci_push        |
+| `BYOC_FILE_PATH`        | `./path/to/optimized/chunk.py`                     | Miner (BYOC mode)       |
+| `REPO_PATH`             | `./path/to/local/repo`                             | Miner (BYOC mode)       |
+
+---
+
+## Required Imports (Critical!)
+
+The validator checks for these **MANDATORY** imports in `chunk.py`. Missing any of these will cause validation to fail with score 0.0:
+
+```python
+from fla.utils import autocast_custom_bwd
+from fla.utils import autocast_custom_fwd
+from fla.utils import autotune_cache_kwargs
+from fla.utils import check_shared_mem
+from fla.utils import input_guard
+```
+
+**Important**: If you're using BYOC mode, ensure your expert code includes all these imports, or the miner will add them automatically based on the repository context.
 
 ---
 

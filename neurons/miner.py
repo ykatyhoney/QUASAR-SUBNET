@@ -188,7 +188,30 @@ class Miner(BaseMinerNeuron):
         try:
             print(f" Loading tokenizer for {self.model_name}...")
             bt.logging.info(f"Loading model: {self.model_name}...")
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+            # Suppress warnings about missing custom_generate files (harmless)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*custom_generate.*")
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+            
+            # Fix pad_token if it's None or same as eos_token (causes attention_mask issues)
+            if self.tokenizer.pad_token is None or self.tokenizer.pad_token == self.tokenizer.eos_token:
+                print(f"[MINER] Setting pad_token (was: {self.tokenizer.pad_token})", flush=True)
+                # Use a different token for padding, or set pad_token_id explicitly
+                if self.tokenizer.eos_token_id is not None:
+                    # For Qwen models, often unk_token_id works, or we can use eos_token_id but handle attention_mask explicitly
+                    if hasattr(self.tokenizer, 'unk_token_id') and self.tokenizer.unk_token_id is not None:
+                        self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
+                        self.tokenizer.pad_token = self.tokenizer.unk_token
+                    else:
+                        # Fallback: use eos_token but we'll handle attention_mask explicitly in generation
+                        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                        self.tokenizer.pad_token = self.tokenizer.eos_token
+                        print(f"[MINER] ⚠️ pad_token == eos_token - will create explicit attention_mask", flush=True)
+                else:
+                    # Last resort: add a pad token
+                    self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                    print(f"[MINER] Added [PAD] token", flush=True)
             
             print(f" Loading model weights for {self.model_name}... (this can take several minutes)")
             # Don't use device_map="auto" if we need to move model to CPU for tests
@@ -1092,13 +1115,16 @@ class Miner(BaseMinerNeuron):
                     add_generation_prompt=True
                 )
                 
-                # Extract input_ids from BatchEncoding
+                # Extract input_ids and attention_mask from BatchEncoding
                 if hasattr(tokenized, 'input_ids'):
                     input_ids = tokenized['input_ids']
+                    attention_mask = getattr(tokenized, 'attention_mask', None)
                 elif isinstance(tokenized, dict):
                     input_ids = tokenized.get('input_ids', tokenized)
+                    attention_mask = tokenized.get('attention_mask', None)
                 else:
                     input_ids = tokenized
+                    attention_mask = None
                 
                 # Ensure it's a tensor and move to device
                 if not isinstance(input_ids, torch.Tensor):
@@ -1106,9 +1132,23 @@ class Miner(BaseMinerNeuron):
                 
                 input_ids = input_ids.to(self.device)
                 
+                # Create attention_mask if not provided (especially important when pad_token == eos_token)
+                if attention_mask is None:
+                    # Create attention mask: 1 for real tokens, 0 for padding
+                    attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+                    # If pad_token_id is same as eos_token_id, create mask based on actual content
+                    if self.tokenizer.pad_token_id == self.tokenizer.eos_token_id:
+                        # For Qwen models, assume all tokens are real (no padding in single-sequence generation)
+                        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+                else:
+                    if not isinstance(attention_mask, torch.Tensor):
+                        attention_mask = torch.tensor(attention_mask)
+                    attention_mask = attention_mask.to(self.device)
+                
                 streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, decode_kwargs={"skip_special_tokens": True})
                 generation_kwargs = dict(
                     input_ids=input_ids,
+                    attention_mask=attention_mask,  # Explicitly provide attention_mask
                     streamer=streamer,
                     max_new_tokens=self.agent_max_new_tokens,
                     temperature=0.7,
