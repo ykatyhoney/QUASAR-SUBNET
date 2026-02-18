@@ -1071,15 +1071,10 @@ def mark_validated(
             # Determine league from target_sequence_length
             league = get_league_for_seq_len(submission.target_sequence_length)
             
-            # Get or create MinerScore entry
-            # Note: model_name is not stored in SpeedSubmission, so we use a default
-            # In the future, miners should register with their model_name
-            model_name = "Unknown"  # Default - miners should register with their model
-            
+            # Find existing MinerScore by hotkey + league only (miners register with real model_name)
             miner_score = db.query(models.MinerScore).filter(
                 models.MinerScore.hotkey == submission.miner_hotkey,
                 models.MinerScore.league == league,
-                models.MinerScore.model_name == model_name
             ).first()
             
             if miner_score:
@@ -1104,10 +1099,10 @@ def mark_validated(
                     )
                     db.add(registration)
                 
-                # Create MinerScore
+                # Create MinerScore (model_name not in SpeedSubmission; use "Unknown")
                 miner_score = models.MinerScore(
                     hotkey=submission.miner_hotkey,
-                    model_name=model_name,
+                    model_name="Unknown",
                     league=league,
                     score=float(score),
                     tasks_completed=1
