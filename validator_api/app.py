@@ -500,27 +500,8 @@ def submit_kernel(
             req.benchmarks
         )
         
-        # Get current round and assign to submission
-        current_round = (
-            db.query(models.CompetitionRound)
-            .filter(models.CompetitionRound.status == "active")
-            .order_by(models.CompetitionRound.round_number.desc())
-            .first()
-        )
-        
-        if not current_round:
-            # Create first round if none exists
-            from datetime import timedelta
-            current_round = models.CompetitionRound(
-                round_number=1,
-                start_time=datetime.utcnow(),
-                end_time=datetime.utcnow() + timedelta(hours=48),
-                status="active"
-            )
-            db.add(current_round)
-            db.commit()
-            db.refresh(current_round)
-            print(f"✅ [ROUND] Created first round #{current_round.round_number}")
+        # Get current round and assign to submission (auto-expires finished rounds)
+        current_round = ensure_current_round(db)
 
         # Create new speed submission
         new_submission = models.SpeedSubmission(
@@ -656,26 +637,8 @@ def commit_submission(
         current_block = get_current_block()
         reveal_block = current_block + BLOCKS_UNTIL_REVEAL
         
-        # Get current round
-        current_round = (
-            db.query(models.CompetitionRound)
-            .filter(models.CompetitionRound.status == "active")
-            .order_by(models.CompetitionRound.round_number.desc())
-            .first()
-        )
-        
-        from datetime import timedelta  # Import here to ensure availability
-        
-        if not current_round:
-            current_round = models.CompetitionRound(
-                round_number=1,
-                start_time=datetime.utcnow(),
-                end_time=datetime.utcnow() + timedelta(hours=48),
-                status="active"
-            )
-            db.add(current_round)
-            db.commit()
-            db.refresh(current_round)
+        # Get current round (auto-expires finished rounds)
+        current_round = ensure_current_round(db)
         
         # Create commitment entry (not revealed yet)
         new_submission = models.SpeedSubmission(
@@ -1312,40 +1275,79 @@ def get_weights(
 
 # ==================== ROUND MANAGEMENT ENDPOINTS ====================
 
-@app.get("/get_current_round", response_model=models.RoundResponse)
-def get_current_round(db: Session = Depends(get_db)):
-    """Get the current active round."""
-    try:
-        current_round = (
+def _finalize_round_impl(round_obj, db):
+    if round_obj.status != "active":
+        return
+    round_obj.status = "evaluating"
+    db.commit()
+    submissions = (
+        db.query(models.SpeedSubmission)
+        .filter(models.SpeedSubmission.round_id == round_obj.id)
+        .filter(models.SpeedSubmission.validated == True)
+        .all()
+    )
+    if not submissions:
+        round_obj.status = "completed"
+        db.commit()
+        return
+    rankings = calculate_rankings(submissions, round_obj.baseline_submission_id, db)
+    if rankings:
+        winner = rankings[0]
+        round_obj.winner_hotkey = winner["miner_hotkey"]
+        round_obj.baseline_submission_id = winner["submission_id"]
+        db.commit()
+        winner_submission = db.query(models.SpeedSubmission).filter(
+            models.SpeedSubmission.id == winner["submission_id"]
+        ).first()
+        if winner_submission:
+            winner_submission.is_baseline = True
+            db.commit()
+    round_obj.status = "completed"
+    db.commit()
+
+
+def ensure_current_round(db):
+    now = datetime.utcnow()
+    expired = (
+        db.query(models.CompetitionRound)
+        .filter(models.CompetitionRound.status == "active")
+        .filter(models.CompetitionRound.end_time < now)
+        .order_by(models.CompetitionRound.round_number.asc())
+        .all()
+    )
+    for r in expired:
+        _finalize_round_impl(r, db)
+    current_round = (
+        db.query(models.CompetitionRound)
+        .filter(models.CompetitionRound.status == "active")
+        .order_by(models.CompetitionRound.round_number.desc())
+        .first()
+    )
+    if not current_round:
+        last_round = (
             db.query(models.CompetitionRound)
-            .filter(models.CompetitionRound.status == "active")
             .order_by(models.CompetitionRound.round_number.desc())
             .first()
         )
-        
-        if not current_round:
-            # Create new round if none exists
-            from datetime import timedelta
-            # Get the highest round number
-            last_round = (
-                db.query(models.CompetitionRound)
-                .order_by(models.CompetitionRound.round_number.desc())
-                .first()
-            )
-            next_round_number = (last_round.round_number + 1) if last_round else 1
-            
-            current_round = models.CompetitionRound(
-                round_number=next_round_number,
-                start_time=datetime.utcnow(),
-                end_time=datetime.utcnow() + timedelta(hours=48),
-                status="active"
-            )
-            db.add(current_round)
-            db.commit()
-            db.refresh(current_round)
-            print(f"✅ [ROUND] Created new round #{current_round.round_number}")
-        
-        # Calculate time remaining
+        next_round_number = (last_round.round_number + 1) if last_round else 1
+        current_round = models.CompetitionRound(
+            round_number=next_round_number,
+            start_time=now,
+            end_time=now + timedelta(hours=48),
+            status="active"
+        )
+        db.add(current_round)
+        db.commit()
+        db.refresh(current_round)
+        print(f"✅ [ROUND] Created new round #{current_round.round_number}")
+    return current_round
+
+
+@app.get("/get_current_round", response_model=models.RoundResponse)
+def get_current_round(db: Session = Depends(get_db)):
+    """Get the current active round. Expires finished rounds and creates a new one if needed."""
+    try:
+        current_round = ensure_current_round(db)
         now = datetime.utcnow()
         time_remaining = max(0, int((current_round.end_time - now).total_seconds()))
         
