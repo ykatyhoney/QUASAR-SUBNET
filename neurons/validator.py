@@ -1115,29 +1115,20 @@ class Validator(BaseValidatorNeuron):
             for hotkey, score in evaluated_scores.items():
                 print(f"[VALIDATOR]   {hotkey[:12]}...: score={score:.4f}", flush=True)
             
-            # Check if current round is ending soon and finalize if needed
+            # Monitor round status (rounds auto-finalize when expired via ensure_current_round)
             try:
                 response = requests.get(f"{VALIDATOR_API_URL}/get_current_round", timeout=10)
                 if response.status_code == 200:
                     round_data = response.json()
                     time_remaining = round_data.get("time_remaining_seconds", 3600)
+                    round_status = round_data.get("status", "active")
                     
-                    # If round ends in < 5 minutes, finalize it
-                    if 0 < time_remaining < 300:
-                        print(f"[VALIDATOR] ⏰ Round ending in {time_remaining}s, finalizing...", flush=True)
-                        try:
-                            finalize_resp = requests.post(
-                                f"{VALIDATOR_API_URL}/finalize_round/{round_data['id']}",
-                                timeout=60
-                            )
-                            if finalize_resp.status_code == 200:
-                                finalize_result = finalize_resp.json()
-                                print(f"[VALIDATOR] ✅ Round {round_data['id']} finalized. Winner: {finalize_result.get('winner', 'N/A')}", flush=True)
-                                bt.logging.info(f"Round {round_data['id']} finalized")
-                            else:
-                                print(f"[VALIDATOR] ⚠️ Failed to finalize round (status {finalize_resp.status_code})", flush=True)
-                        except Exception as e:
-                            print(f"[VALIDATOR] ⚠️ Failed to finalize round: {e}", flush=True)
+                    if round_status == "active":
+                        if time_remaining <= 0:
+                            print(f"[VALIDATOR] ⏰ Round {round_data.get('round_number')} has expired (will auto-finalize)", flush=True)
+                        elif time_remaining < 3600:
+                            hours_remaining = time_remaining / 3600
+                            print(f"[VALIDATOR] ⏰ Round {round_data.get('round_number')} ending soon: {hours_remaining:.1f}h remaining", flush=True)
             except Exception as e:
                 print(f"[VALIDATOR] ⚠️ Round check failed: {e}", flush=True)
             

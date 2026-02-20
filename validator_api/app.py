@@ -1621,6 +1621,16 @@ def finalize_round(round_id: int, db: Session = Depends(get_db)):
     if round_obj.status != "active":
         raise HTTPException(status_code=400, detail="Round already finalized")
     
+    # CRITICAL: Only allow finalization if round has actually expired
+    now = datetime.utcnow()
+    if round_obj.end_time > now:
+        time_remaining = (round_obj.end_time - now).total_seconds()
+        hours_remaining = time_remaining / 3600
+        raise HTTPException(
+            status_code=400,
+            detail=f"Round has not expired yet. {hours_remaining:.2f} hours remaining. Rounds must run for full 48 hours."
+        )
+    
     # Mark as evaluating
     round_obj.status = "evaluating"
     db.commit()
