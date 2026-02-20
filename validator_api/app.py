@@ -1389,46 +1389,81 @@ def create_round(
     req: models.CreateRoundRequest,
     db: Session = Depends(get_db)
 ):
-    """Create a new competition round."""
-    # Get last round number
-    last_round = (
-        db.query(models.CompetitionRound)
-        .order_by(models.CompetitionRound.round_number.desc())
-        .first()
-    )
+    """Create a new competition round.
     
-    next_round_number = (last_round.round_number + 1) if last_round else 1
+    Request body (can send empty {} to use defaults):
+    - duration_hours: int (default: 48)
+    - baseline_submission_id: Optional[int] (default: None)
     
-    # Mark previous round as completed
-    if last_round and last_round.status == "active":
-        last_round.status = "completed"
+    Example:
+    - Empty body: {}
+    - With duration: {"duration_hours": 24}
+    - With baseline: {"duration_hours": 48, "baseline_submission_id": 123}
+    """
+    try:
+        # Get last round number
+        last_round = (
+            db.query(models.CompetitionRound)
+            .order_by(models.CompetitionRound.round_number.desc())
+            .first()
+        )
+        
+        next_round_number = (last_round.round_number + 1) if last_round else 1
+        
+        # Mark previous round as completed
+        if last_round and last_round.status == "active":
+            last_round.status = "completed"
+            db.commit()
+        
+        # Create new round
+        from datetime import timedelta
+        now = datetime.utcnow()
+        new_round = models.CompetitionRound(
+            round_number=next_round_number,
+            start_time=now,
+            end_time=now + timedelta(hours=req.duration_hours),
+            status="active",
+            baseline_submission_id=req.baseline_submission_id
+        )
+        
+        db.add(new_round)
         db.commit()
-    
-    # Create new round
-    from datetime import timedelta
-    new_round = models.CompetitionRound(
-        round_number=next_round_number,
-        start_time=datetime.utcnow(),
-        end_time=datetime.utcnow() + timedelta(hours=req.duration_hours),
-        status="active",
-        baseline_submission_id=req.baseline_submission_id
-    )
-    
-    db.add(new_round)
-    db.commit()
-    db.refresh(new_round)
-    
-    print(f"✅ [ROUND] Created round #{next_round_number} (baseline: {req.baseline_submission_id})")
-    
-    return models.RoundResponse(
-        id=new_round.id,
-        round_number=new_round.round_number,
-        start_time=new_round.start_time,
-        end_time=new_round.end_time,
-        status=new_round.status,
-        time_remaining_seconds=int((new_round.end_time - datetime.utcnow()).total_seconds()),
-        baseline_submission_id=new_round.baseline_submission_id
-    )
+        db.refresh(new_round)
+        
+        # Count submissions in this round (should be 0 for new round)
+        submission_count = (
+            db.query(models.SpeedSubmission)
+            .filter(models.SpeedSubmission.round_id == new_round.id)
+            .count()
+        )
+        
+        print(f"✅ [ROUND] Created round #{next_round_number} (baseline: {req.baseline_submission_id})")
+        
+        # Format response with proper datetime handling
+        time_remaining = max(0, int((new_round.end_time - datetime.utcnow()).total_seconds()))
+        
+        return models.RoundResponse(
+            id=new_round.id,
+            round_number=new_round.round_number,
+            start_time=new_round.start_time.isoformat() if isinstance(new_round.start_time, datetime) else str(new_round.start_time),
+            end_time=new_round.end_time.isoformat() if isinstance(new_round.end_time, datetime) else str(new_round.end_time),
+            status=new_round.status,
+            time_remaining_seconds=time_remaining,
+            baseline_submission_id=new_round.baseline_submission_id,
+            winner_hotkey=new_round.winner_hotkey,
+            total_submissions=submission_count
+        )
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"❌ [CREATE_ROUND] Error: {e}"
+        print(error_msg)
+        print(traceback.format_exc())
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating round: {str(e)}"
+        )
 
 def calculate_rankings(
     submissions: List[models.SpeedSubmission],
