@@ -1415,6 +1415,21 @@ def create_round(
             last_round.status = "completed"
             db.commit()
         
+        # Handle baseline_submission_id: convert 0 to None, validate if provided
+        baseline_submission_id = req.baseline_submission_id
+        if baseline_submission_id == 0 or baseline_submission_id is None:
+            baseline_submission_id = None
+        else:
+            # Validate that the baseline submission exists
+            baseline_submission = db.query(models.SpeedSubmission).filter(
+                models.SpeedSubmission.id == baseline_submission_id
+            ).first()
+            if not baseline_submission:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Baseline submission {baseline_submission_id} not found"
+                )
+        
         # Create new round
         from datetime import timedelta
         now = datetime.utcnow()
@@ -1423,7 +1438,7 @@ def create_round(
             start_time=now,
             end_time=now + timedelta(hours=req.duration_hours),
             status="active",
-            baseline_submission_id=req.baseline_submission_id
+            baseline_submission_id=baseline_submission_id
         )
         
         db.add(new_round)
