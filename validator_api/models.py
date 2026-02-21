@@ -207,6 +207,7 @@ class RegisterMinerRequest(BaseModel):
     hotkey: str
     model_name: str
     league: str  # "100k", "200k", ..., "1M"
+    uid: Optional[int] = None
 
 class LeagueInfoResponse(BaseModel):
     league: str

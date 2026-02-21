@@ -1097,6 +1097,28 @@ class Validator(BaseValidatorNeuron):
                 print(f"[VALIDATOR] ⚠️ Failed to get submission rate: {e}, using default 5min", flush=True)
                 bt.logging.warning(f"Failed to get submission rate: {e}")
             
+            # Sync metagraph UIDs to the API so weights are set to correct UIDs
+            try:
+                self.metagraph.sync(subtensor=self.subtensor)
+                uid_map = {}
+                for uid_idx in range(self.metagraph.n):
+                    hk = self.metagraph.hotkeys[uid_idx]
+                    uid_map[hk] = uid_idx
+                if uid_map:
+                    sync_resp = requests.post(
+                        f"{VALIDATOR_API_URL}/sync_uids",
+                        json=uid_map,
+                        timeout=15
+                    )
+                    if sync_resp.status_code == 200:
+                        sync_data = sync_resp.json()
+                        if sync_data.get("updated", 0) > 0:
+                            print(f"[VALIDATOR] 🔄 Synced {sync_data['updated']} UIDs to API", flush=True)
+                    else:
+                        print(f"[VALIDATOR] ⚠️ UID sync failed (status {sync_resp.status_code})", flush=True)
+            except Exception as e:
+                print(f"[VALIDATOR] ⚠️ UID sync failed: {e}", flush=True)
+
             # Evaluate performance submissions
             print("[VALIDATOR] ⚡ Evaluating performance submissions...", flush=True)
             evaluated_scores = self.evaluate_performance_submissions()
@@ -1132,30 +1154,46 @@ class Validator(BaseValidatorNeuron):
             except Exception as e:
                 print(f"[VALIDATOR] ⚠️ Round check failed: {e}", flush=True)
             
-            # Fetch and submit weights from API (for completed rounds)
+            # Fetch weights from API and update self.scores for on-chain submission
             try:
                 response = requests.get(f"{VALIDATOR_API_URL}/get_weights", timeout=10)
                 if response.status_code == 200:
                     weights_data = response.json()
-                    weights = weights_data.get("weights", [])
+                    weight_entries = weights_data.get("weights", [])
                     
-                    if weights:
-                        # Get miner UIDs from weights
-                        miner_uids = []
-                        for weight_entry in weights:
-                            uid = weight_entry.get("uid", 0)
-                            if uid > 0:
-                                miner_uids.append(uid)
+                    if weight_entries:
+                        # Build hotkey -> UID mapping from metagraph (the authoritative source)
+                        hotkey_to_uid = {}
+                        for uid_idx in range(self.metagraph.n):
+                            hk = self.metagraph.hotkeys[uid_idx]
+                            hotkey_to_uid[hk] = uid_idx
                         
-                        if miner_uids:
-                            print(f"[VALIDATOR] 📊 Fetching weights for {len(miner_uids)} miners", flush=True)
-                            bt.logging.info(f"Fetching weights for {len(miner_uids)} miners")
-                            # Submit weights to chain
-                            await self.submit_weights(miner_uids)
+                        # Reset scores to zero, then populate from API weights
+                        self.scores = torch.zeros(self.metagraph.n, dtype=torch.float32, device=self.device)
+                        resolved_count = 0
+                        
+                        for entry in weight_entries:
+                            hotkey = entry.get("hotkey", "")
+                            weight = entry.get("weight", 0.0)
+                            
+                            if hotkey in hotkey_to_uid:
+                                uid = hotkey_to_uid[hotkey]
+                                self.scores[uid] = weight
+                                resolved_count += 1
+                                print(f"[VALIDATOR]   UID {uid} ({hotkey[:12]}...): weight={weight:.4f}", flush=True)
+                            else:
+                                print(f"[VALIDATOR] ⚠️ Hotkey {hotkey[:12]}... not found in metagraph, skipping", flush=True)
+                        
+                        if resolved_count > 0:
+                            print(f"[VALIDATOR] 📊 Updated self.scores for {resolved_count} miners from API weights", flush=True)
+                            bt.logging.info(f"Updated scores for {resolved_count} miners, calling set_weights()")
+                            self.save_state()
+                            self.set_weights()
+                            bt.logging.success(f"✅ Weights submitted to Bittensor chain")
                         else:
-                            print(f"[VALIDATOR] ⚠️ No valid UIDs in weights data", flush=True)
+                            print(f"[VALIDATOR] ⚠️ No miners from API weights found in metagraph", flush=True)
                     else:
-                        print(f"[VALIDATOR] ⚠️ No weights available yet", flush=True)
+                        print(f"[VALIDATOR] ⚠️ No weights available yet from API", flush=True)
             except Exception as e:
                 print(f"[VALIDATOR] ⚠️ Weight fetching/submission failed: {e}", flush=True)
                 bt.logging.warning(f"Weight submission failed: {e}")
@@ -1171,39 +1209,12 @@ class Validator(BaseValidatorNeuron):
             # Wait 5 minutes on error before retrying
             time.sleep(300)
 
-    async def submit_weights(self, miner_uids: List[int]):
-        """Submit weights to Bittensor based on challenge container scores."""
-        
-        # Create weight vector (all miners get 0, evaluated miners get their scores)
-        weights = torch.zeros(self.metagraph.n, dtype=torch.float32, device=self.device)
-        
-        for uid in miner_uids:
-            weights[uid] = self.scores[uid]
-        
-        # Normalize weights to sum to 1.0
-        weight_sum = weights.sum()
-        if weight_sum > 0:
-            weights = weights / weight_sum
-        else:
-            # If all scores are 0, distribute evenly
-            if len(miner_uids) > 0:
-                weights[miner_uids] = 1.0 / len(miner_uids)
-        
-        # Convert to u16 format for Bittensor (0-65535)
-        weights_u16 = (weights * 65535).to(torch.uint16)
-        
-        try:
-            # Set weights on self (Bittensor reads from self.weights)
-            self.weights = weights_u16
-            
-            # Submit weights to Bittensor (no arguments needed)
-            self.set_weights()
-            
-            bt.logging.success(f"✅ Weights submitted to Bittensor")
-            bt.logging.info(f"   Top miners: {[(uid, float(weights[uid])) for uid in sorted(miner_uids, key=lambda u: weights[u], reverse=True)[:5]]}")
-            
-        except Exception as e:
-            bt.logging.error(f"❌ Failed to submit weights: {e}")
+    def resolve_uid_from_metagraph(self, hotkey: str) -> int:
+        """Resolve a miner's UID from the metagraph using their hotkey."""
+        for uid_idx in range(self.metagraph.n):
+            if self.metagraph.hotkeys[uid_idx] == hotkey:
+                return uid_idx
+        return -1
 
 
 if __name__ == "__main__":

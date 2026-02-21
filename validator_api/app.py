@@ -1120,8 +1120,10 @@ def register_miner(
         models.MinerScore.league == req.league
     ).first()
 
+    miner_uid = req.uid if req.uid is not None else 0
+
     if existing:
-        # Check if MinerRegistration exists, create if not
+        # Check if MinerRegistration exists, create or update
         registration = db.query(models.MinerRegistration).filter(
             models.MinerRegistration.hotkey == hotkey
         ).first()
@@ -1129,11 +1131,15 @@ def register_miner(
         if not registration:
             new_registration = models.MinerRegistration(
                 hotkey=hotkey,
-                uid=0
+                uid=miner_uid
             )
             db.add(new_registration)
             db.commit()
-            print(f"✅ [REGISTER] Created missing MinerRegistration for {hotkey[:8]}")
+            print(f"✅ [REGISTER] Created missing MinerRegistration for {hotkey[:8]} with UID={miner_uid}")
+        elif registration.uid == 0 and miner_uid > 0:
+            registration.uid = miner_uid
+            db.commit()
+            print(f"✅ [REGISTER] Updated UID for {hotkey[:8]}: 0 -> {miner_uid}")
 
         print(f"ℹ️ [REGISTER] Miner {hotkey[:8]} already registered for {req.model_name} in {req.league}")
         return {
@@ -1141,7 +1147,8 @@ def register_miner(
             "hotkey": hotkey,
             "model_name": req.model_name,
             "league": req.league,
-            "current_score": existing.score
+            "current_score": existing.score,
+            "uid": registration.uid if registration else miner_uid
         }
 
     # Create new registration
@@ -1154,22 +1161,54 @@ def register_miner(
     )
     db.add(new_score)
 
-    # Create MinerRegistration entry
+    # Create MinerRegistration entry with actual UID
     new_registration = models.MinerRegistration(
         hotkey=hotkey,
-        uid=0  # Will be updated when miner is found on metagraph
+        uid=miner_uid
     )
     db.add(new_registration)
 
     db.commit()
 
-    print(f"✅ [REGISTER] Miner {hotkey[:8]} registered for {req.model_name} in {req.league}")
+    print(f"✅ [REGISTER] Miner {hotkey[:8]} registered for {req.model_name} in {req.league} with UID={miner_uid}")
     return {
         "status": "registered",
         "hotkey": hotkey,
         "model_name": req.model_name,
-        "league": req.league
+        "league": req.league,
+        "uid": miner_uid
     }
+
+@app.post("/sync_uids")
+def sync_uids(
+    uid_map: Dict[str, int],
+    db: Session = Depends(get_db)
+):
+    """
+    Bulk-update miner UIDs from the metagraph.
+    Accepts a dict of {hotkey: uid} and updates all matching MinerRegistration records.
+    Called by validators who have access to the metagraph.
+    """
+    updated = 0
+    for hotkey, uid in uid_map.items():
+        registration = db.query(models.MinerRegistration).filter(
+            models.MinerRegistration.hotkey == hotkey
+        ).first()
+        if registration:
+            if registration.uid != uid:
+                old_uid = registration.uid
+                registration.uid = uid
+                updated += 1
+                print(f"[SYNC_UIDS] Updated {hotkey[:12]}...: UID {old_uid} -> {uid}")
+        else:
+            new_reg = models.MinerRegistration(hotkey=hotkey, uid=uid)
+            db.add(new_reg)
+            updated += 1
+            print(f"[SYNC_UIDS] Created registration for {hotkey[:12]}... with UID={uid}")
+    
+    db.commit()
+    print(f"[SYNC_UIDS] Synced {updated} UIDs from metagraph")
+    return {"status": "ok", "updated": updated, "total_entries": len(uid_map)}
 
 # Updated reward distribution for top 4
 REWARD_DISTRIBUTION = [0.60, 0.25, 0.10, 0.05]  # 60%, 25%, 10%, 5%
