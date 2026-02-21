@@ -1231,7 +1231,7 @@ def get_weights(
     Args:
         round_id: Optional round ID. If not specified, uses the most recent completed round.
     """
-    # If round_id not specified, get current completed round
+    # If round_id not specified, get most recent completed round; fall back to active round
     if round_id is None:
         round_obj = (
             db.query(models.CompetitionRound)
@@ -1239,13 +1239,22 @@ def get_weights(
             .order_by(models.CompetitionRound.round_number.desc())
             .first()
         )
+        if not round_obj:
+            round_obj = (
+                db.query(models.CompetitionRound)
+                .filter(models.CompetitionRound.status == "active")
+                .order_by(models.CompetitionRound.round_number.desc())
+                .first()
+            )
+            if round_obj:
+                print(f"[WEIGHTS] No completed round yet, using active round {round_obj.round_number} for interim weights")
     else:
         round_obj = db.query(models.CompetitionRound).filter(
             models.CompetitionRound.id == round_id
         ).first()
     
     if not round_obj:
-        print("[WEIGHTS] No completed round found")
+        print("[WEIGHTS] No round found (completed or active)")
         return GetWeightsResponse(epoch=int(time.time()), weights=[])
     
     # Get all validated submissions for this round

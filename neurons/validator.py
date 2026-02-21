@@ -565,8 +565,8 @@ class Validator(BaseValidatorNeuron):
             bt.logging.info(f"   Cosine sim threshold: {self.cosine_sim_threshold}")
             bt.logging.info(f"   Max abs diff threshold: {self.max_abs_diff_threshold}")
         
-        # Initialize scores
-        self.scores = torch.zeros(self.metagraph.n, dtype=torch.float32, device=self.device)
+        # Initialize scores as numpy (must match base class which uses numpy throughout)
+        self.scores = np.zeros(self.metagraph.n, dtype=np.float32)
         self.load_state()
         
         bt.logging.info(f"📡 Validator API URL: {VALIDATOR_API_URL}")
@@ -1029,29 +1029,49 @@ class Validator(BaseValidatorNeuron):
         return evaluated_scores
 
     def load_state(self):
-        """Load validator state from disk."""
+        """Load validator state from disk (numpy format, compatible with base class)."""
         try:
-            state_path = self.config.neuron.full_path + "/state.pt"
-            if os.path.exists(state_path):
-                state = torch.load(state_path, weights_only=False)
+            # Try numpy format first (base class format)
+            npz_path = self.config.neuron.full_path + "/state.npz"
+            pt_path = self.config.neuron.full_path + "/state.pt"
+            
+            if os.path.exists(npz_path):
+                state = np.load(npz_path, allow_pickle=True)
+                self.step = int(state.get("step", 0))
+                scores = state.get("scores", self.scores)
+                if isinstance(scores, torch.Tensor):
+                    scores = scores.detach().cpu().numpy()
+                self.scores = np.array(scores, dtype=np.float32)
+                if hasattr(state, 'files') and "hotkeys" in state.files:
+                    self.hotkeys = list(state["hotkeys"])
+                bt.logging.success("💾 State loaded from npz successfully.")
+            elif os.path.exists(pt_path):
+                state = torch.load(pt_path, weights_only=False)
                 self.step = state.get("step", 0)
                 scores = state.get("scores", self.scores)
-                # Convert numpy array to torch tensor if needed
-                if isinstance(scores, np.ndarray):
-                    scores = torch.from_numpy(scores).float()
-                self.scores = scores.to(self.device)
-                bt.logging.success("💾 State loaded successfully.")
+                if isinstance(scores, torch.Tensor):
+                    scores = scores.detach().cpu().numpy()
+                self.scores = np.array(scores, dtype=np.float32)
+                bt.logging.success("💾 State loaded from pt (legacy) successfully.")
         except Exception as e:
             bt.logging.warning(f"⚠️ Failed to load state (starting fresh): {e}")
 
+    def should_set_weights(self) -> bool:
+        """Override base class: we handle set_weights() in forward(), not in sync()."""
+        return False
+
     def save_state(self):
-        """Save validator state to disk."""
+        """Save validator state to disk (numpy format, compatible with base class)."""
         try:
-            state = {
-                "step": self.step,
-                "scores": self.scores,
-            }
-            torch.save(state, self.config.neuron.full_path + "/state.pt")
+            scores = self.scores
+            if isinstance(scores, torch.Tensor):
+                scores = scores.detach().cpu().numpy()
+            np.savez(
+                self.config.neuron.full_path + "/state.npz",
+                step=self.step,
+                scores=scores,
+                hotkeys=self.hotkeys,
+            )
             bt.logging.info("💾 State saved.")
         except Exception as e:
             bt.logging.error(f"❌ Failed to save state: {e}")
@@ -1123,19 +1143,13 @@ class Validator(BaseValidatorNeuron):
             print("[VALIDATOR] ⚡ Evaluating performance submissions...", flush=True)
             evaluated_scores = self.evaluate_performance_submissions()
             
-            # If no submissions were evaluated, wait before next cycle
             if not evaluated_scores:
-                print(f"[VALIDATOR] ⚠️ No pending submissions to evaluate, waiting {polling_interval}s...", flush=True)
-                bt.logging.info(f"No pending submissions, waiting {polling_interval}s...")
-                time.sleep(polling_interval)
-                return
-            
-            # Evaluation complete - scores are already updated in API
-            print(f"[VALIDATOR] ✅ Evaluation complete: {len(evaluated_scores)} submissions evaluated", flush=True)
-            bt.logging.success(f"✅ Evaluation complete: {len(evaluated_scores)} submissions")
-            
-            for hotkey, score in evaluated_scores.items():
-                print(f"[VALIDATOR]   {hotkey[:12]}...: score={score:.4f}", flush=True)
+                print(f"[VALIDATOR] ⚠️ No pending submissions to evaluate", flush=True)
+            else:
+                print(f"[VALIDATOR] ✅ Evaluation complete: {len(evaluated_scores)} submissions evaluated", flush=True)
+                bt.logging.success(f"✅ Evaluation complete: {len(evaluated_scores)} submissions")
+                for hotkey, score in evaluated_scores.items():
+                    print(f"[VALIDATOR]   {hotkey[:12]}...: score={score:.4f}", flush=True)
             
             # Monitor round status (rounds auto-finalize when expired via ensure_current_round)
             try:
@@ -1169,7 +1183,7 @@ class Validator(BaseValidatorNeuron):
                             hotkey_to_uid[hk] = uid_idx
                         
                         # Reset scores to zero, then populate from API weights
-                        self.scores = torch.zeros(self.metagraph.n, dtype=torch.float32, device=self.device)
+                        self.scores = np.zeros(self.metagraph.n, dtype=np.float32)
                         resolved_count = 0
                         
                         for entry in weight_entries:
@@ -1178,7 +1192,7 @@ class Validator(BaseValidatorNeuron):
                             
                             if hotkey in hotkey_to_uid:
                                 uid = hotkey_to_uid[hotkey]
-                                self.scores[uid] = weight
+                                self.scores[uid] = float(weight)
                                 resolved_count += 1
                                 print(f"[VALIDATOR]   UID {uid} ({hotkey[:12]}...): weight={weight:.4f}", flush=True)
                             else:
