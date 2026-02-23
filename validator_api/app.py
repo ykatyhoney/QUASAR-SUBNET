@@ -972,9 +972,9 @@ def get_submission_stats(
                 {
                     "id": s.id,
                     "miner_hotkey": s.miner_hotkey,
-                    "fork_url": s.fork_url,
-                    "commit_hash": s.commit_hash,
-                    "repo_hash": s.repo_hash,  # Repository context hash
+                    "fork_url": "[HIDDEN]",
+                    "commit_hash": "[HIDDEN]",
+                    "repo_hash": s.repo_hash,
                     "target_sequence_length": s.target_sequence_length,
                     "tokens_per_sec": s.tokens_per_sec,
                     "vram_mb": s.vram_mb,
@@ -1009,6 +1009,44 @@ def get_submission_stats(
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+@app.get("/get_pending_validations")
+def get_pending_validations(
+    limit: int = 10,
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature)
+):
+    """
+    Validator-only endpoint: Get unvalidated submissions with full details (including fork_url).
+    Requires validator authentication. fork_url is never exposed to public endpoints.
+    """
+    submissions = (
+        db.query(models.SpeedSubmission)
+        .filter(models.SpeedSubmission.validated == False)
+        .order_by(models.SpeedSubmission.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "pending_count": len(submissions),
+        "submissions": [
+            {
+                "id": s.id,
+                "miner_hotkey": s.miner_hotkey,
+                "fork_url": s.fork_url,
+                "commit_hash": s.commit_hash,
+                "repo_hash": s.repo_hash,
+                "target_sequence_length": s.target_sequence_length,
+                "tokens_per_sec": s.tokens_per_sec,
+                "vram_mb": s.vram_mb,
+                "benchmarks": s.benchmarks,
+                "validated": s.validated,
+                "created_at": s.created_at.isoformat()
+            }
+            for s in submissions
+        ]
+    }
 
 @app.post("/mark_validated")
 def mark_validated(

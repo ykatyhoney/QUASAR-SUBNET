@@ -179,22 +179,41 @@ class PerformanceValidator:
         return len(errors) == 0, errors
     
     def fetch_pending_submissions(self, limit: int = 10) -> List[Dict]:
-        """Fetch pending submissions from validator API."""
+        """Fetch pending (unvalidated) submissions from validator API.
+        Uses authenticated endpoint that returns full details including fork_url.
+        """
         try:
+            headers = {}
+            if self.validator_instance:
+                wallet = self.validator_instance.wallet
+                hotkey = wallet.hotkey.ss58_address
+                signature = wallet.hotkey.sign(hotkey.encode()).hex()
+                headers = {"Hotkey": hotkey, "Signature": signature}
+
             response = requests.get(
-                f"{self.validator_api_url}/get_submission_stats",
+                f"{self.validator_api_url}/get_pending_validations",
                 params={"limit": limit},
+                headers=headers,
                 timeout=30
             )
             response.raise_for_status()
             data = response.json()
-            
-            # Filter for submissions that haven't been validated yet
-            # For now, we'll return all recent submissions
-            return data.get("recent_submissions", [])
+            return data.get("submissions", [])
         except Exception as e:
-            print(f"[VALIDATOR] Error fetching submissions: {e}")
-            return []
+            print(f"[VALIDATOR] Error fetching pending submissions: {e}")
+            # Fallback to public endpoint (fork_url will be hidden)
+            try:
+                response = requests.get(
+                    f"{self.validator_api_url}/get_submission_stats",
+                    params={"limit": limit},
+                    timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data.get("recent_submissions", [])
+            except Exception as e2:
+                print(f"[VALIDATOR] Fallback also failed: {e2}")
+                return []
     
     def clone_miner_repo(self, fork_url: str) -> str:
         """Clone miner's fork repository to temporary directory."""
