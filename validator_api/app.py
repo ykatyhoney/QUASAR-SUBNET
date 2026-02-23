@@ -467,13 +467,19 @@ def submit_kernel(
         if req.miner_hotkey != hotkey:
             raise HTTPException(status_code=403, detail="Hotkey mismatch")
 
-        # Check if miner is registered
+        # Check if miner is registered, auto-register if not
         miner_reg = db.query(models.MinerRegistration).filter(
             models.MinerRegistration.hotkey == hotkey
         ).first()
 
         if not miner_reg:
-            raise HTTPException(status_code=404, detail="Miner not registered")
+            miner_reg = models.MinerRegistration(
+                hotkey=hotkey,
+                uid=0
+            )
+            db.add(miner_reg)
+            db.commit()
+            print(f"✅ [SUBMIT_KERNEL] Auto-registered miner {hotkey[:8]}... (UID will be synced from metagraph)")
 
         # Extract IP address from request (for IP banning)
         client_ip = None
@@ -602,13 +608,19 @@ def commit_submission(
         if req.miner_hotkey != hotkey:
             raise HTTPException(status_code=403, detail="Hotkey mismatch")
         
-        # Check if miner is registered
+        # Check if miner is registered, auto-register if not
         miner_reg = db.query(models.MinerRegistration).filter(
             models.MinerRegistration.hotkey == hotkey
         ).first()
         
         if not miner_reg:
-            raise HTTPException(status_code=404, detail="Miner not registered")
+            miner_reg = models.MinerRegistration(
+                hotkey=hotkey,
+                uid=0
+            )
+            db.add(miner_reg)
+            db.commit()
+            print(f"✅ [COMMIT] Auto-registered miner {hotkey[:8]}... (UID will be synced from metagraph)")
         
         # Extract IP address
         client_ip = None
