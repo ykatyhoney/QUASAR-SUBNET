@@ -921,8 +921,9 @@ class Validator(BaseValidatorNeuron):
         evaluated_scores = {}  # hotkey -> score
 
         try:
-            # Fetch pending submissions from API
-            submissions = self.performance_validator.fetch_pending_submissions(limit=5)
+            # Fetch pending submissions from API (batch size configurable for backlog drain)
+            batch_size = int(os.getenv("VALIDATOR_PENDING_BATCH_SIZE", "10"))
+            submissions = self.performance_validator.fetch_pending_submissions(limit=batch_size)
 
             if not submissions:
                 print("[VALIDATOR] No performance submissions to evaluate", flush=True)
