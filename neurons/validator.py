@@ -178,21 +178,28 @@ class PerformanceValidator:
 
         return len(errors) == 0, errors
     
-    def fetch_pending_submissions(self, limit: int = 10) -> List[Dict]:
-        """Fetch pending (unvalidated) submissions from validator API.
+    def fetch_pending_submissions(self, limit: int = 10, network: Optional[str] = None) -> List[Dict]:
+        """Fetch pending (unvalidated) submissions from validator API for the given network.
         Uses authenticated endpoint that returns full details including fork_url.
         """
         try:
             headers = {}
+            params = {"limit": limit}
             if self.validator_instance:
                 wallet = self.validator_instance.wallet
                 hotkey = wallet.hotkey.ss58_address
                 signature = wallet.hotkey.sign(hotkey.encode()).hex()
                 headers = {"Hotkey": hotkey, "Signature": signature}
+                if network is None:
+                    net = getattr(self.validator_instance.subtensor, "network", None) or "finney"
+                    network = "test" if str(net).lower() == "test" else "finney"
+            if network is None:
+                network = "finney"
+            params["network"] = network
 
             response = requests.get(
                 f"{self.validator_api_url}/get_pending_validations",
-                params={"limit": limit},
+                params=params,
                 headers=headers,
                 timeout=30
             )
@@ -1145,9 +1152,11 @@ class Validator(BaseValidatorNeuron):
                     hk = self.metagraph.hotkeys[uid_idx]
                     uid_map[hk] = uid_idx
                 if uid_map:
+                    net = getattr(self.subtensor, "network", None) or "finney"
+                    network = "test" if str(net).lower() == "test" else "finney"
                     sync_resp = requests.post(
                         f"{VALIDATOR_API_URL}/sync_uids",
-                        json=uid_map,
+                        json={"network": network, "uid_map": uid_map},
                         timeout=15
                     )
                     if sync_resp.status_code == 200:
@@ -1173,7 +1182,13 @@ class Validator(BaseValidatorNeuron):
             
             # Monitor round status (rounds auto-finalize when expired via ensure_current_round)
             try:
-                response = requests.get(f"{VALIDATOR_API_URL}/get_current_round", timeout=10)
+                net = getattr(self.subtensor, "network", None) or "finney"
+                network = "test" if str(net).lower() == "test" else "finney"
+                response = requests.get(
+                    f"{VALIDATOR_API_URL}/get_current_round",
+                    params={"network": network},
+                    timeout=10
+                )
                 if response.status_code == 200:
                     round_data = response.json()
                     time_remaining = round_data.get("time_remaining_seconds", 3600)
@@ -1190,7 +1205,13 @@ class Validator(BaseValidatorNeuron):
             
             # Fetch weights from API and update self.scores for on-chain submission
             try:
-                response = requests.get(f"{VALIDATOR_API_URL}/get_weights", timeout=10)
+                net = getattr(self.subtensor, "network", None) or "finney"
+                network = "test" if str(net).lower() == "test" else "finney"
+                response = requests.get(
+                    f"{VALIDATOR_API_URL}/get_weights",
+                    params={"network": network},
+                    timeout=10
+                )
                 if response.status_code == 200:
                     weights_data = response.json()
                     weight_entries = weights_data.get("weights", [])

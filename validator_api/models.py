@@ -38,28 +38,34 @@ class Result(Base):
 
 class MinerScore(Base):
     __tablename__ = "miner_scores"
+    __table_args__ = (PrimaryKeyConstraint("hotkey", "model_name", "league", "network", name="pk_miner_score"),)
 
-    hotkey = Column(String, primary_key=True, index=True)
-    model_name = Column(String, index=True)  # e.g., "Qwen-2.5-0.5B", "Kimi-48B"
-    league = Column(String, index=True)  # e.g., "100k", "200k", ..., "1M"
+    hotkey = Column(String, nullable=False, index=True)
+    model_name = Column(String, nullable=False, index=True)  # e.g., "Qwen-2.5-0.5B", "Kimi-48B"
+    league = Column(String, nullable=False, index=True)  # e.g., "100k", "200k", ..., "1M"
+    network = Column(String, default=DEFAULT_NETWORK, nullable=False, index=True)  # "finney" or "test"
     score = Column(Float, default=0.0)
     tasks_completed = Column(Integer, default=0)  # Track tasks per league
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class MinerRegistration(Base):
     __tablename__ = "miner_registrations"
+    __table_args__ = (PrimaryKeyConstraint("hotkey", "network"),)
 
-    hotkey = Column(String, primary_key=True, index=True)
+    hotkey = Column(String, nullable=False, index=True)
+    network = Column(String, default=DEFAULT_NETWORK, nullable=False, index=True)  # "finney" or "test"
     uid = Column(Integer, nullable=False)
     registered_at = Column(Integer, nullable=False, default=lambda: int(datetime.utcnow().timestamp()))
     last_seen = Column(Integer, nullable=False, default=lambda: int(datetime.utcnow().timestamp()))
 
 class CompetitionRound(Base):
-    """Represents a competition round."""
+    """Represents a competition round (per network)."""
     __tablename__ = "competition_rounds"
-    
+    __table_args__ = (UniqueConstraint("round_number", "network", name="uq_round_number_network"),)
+
     id = Column(Integer, primary_key=True, index=True)
-    round_number = Column(Integer, unique=True, nullable=False, index=True)
+    round_number = Column(Integer, nullable=False, index=True)
+    network = Column(String, default=DEFAULT_NETWORK, nullable=False, index=True)  # "finney" or "test"
     start_time = Column(DateTime, nullable=False)
     end_time = Column(DateTime, nullable=False)
     status = Column(String, default="active")  # "active", "evaluating", "completed"
@@ -87,6 +93,7 @@ class SpeedSubmission(Base):
     __tablename__ = "speed_submissions"
 
     id = Column(Integer, primary_key=True, index=True)
+    network = Column(String, default=DEFAULT_NETWORK, nullable=False, index=True)  # "finney" or "test"
     miner_hotkey = Column(String, index=True)
     miner_uid = Column(Integer)
     fork_url = Column(String)
@@ -208,6 +215,7 @@ class RegisterMinerRequest(BaseModel):
     model_name: str
     league: str  # "100k", "200k", ..., "1M"
     uid: Optional[int] = None
+    network: Optional[str] = None  # "finney" (mainnet) or "test" (testnet); default finney
 
 class LeagueInfoResponse(BaseModel):
     league: str
@@ -231,6 +239,7 @@ class SpeedSubmissionRequest(BaseModel):
     vram_mb: Optional[float] = None
     benchmarks: Optional[Dict[str, Dict[str, float]]] = None
     signature: str
+    network: Optional[str] = None  # "finney" (mainnet) or "test" (testnet); default finney
 
 class SpeedSubmissionResponse(BaseModel):
     submission_id: int
@@ -266,6 +275,7 @@ class CreateRoundRequest(BaseModel):
     """Request to create a new round."""
     duration_hours: int = 48  # Default 2 days
     baseline_submission_id: Optional[int] = None  # For round 2+
+    network: Optional[str] = None  # "finney" or "test"; default finney
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -278,6 +288,7 @@ class CommitSubmissionRequest(BaseModel):
     commitment_hash: str  # SHA256(salt + docker_image or fork_url)
     target_sequence_length: int
     signature: str
+    network: Optional[str] = None  # "finney" or "test"; default finney
 
 
 class CommitSubmissionResponse(BaseModel):

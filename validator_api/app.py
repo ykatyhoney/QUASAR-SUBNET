@@ -240,6 +240,39 @@ try:
                 conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN score REAL"))
                 conn.commit()
             
+            # ═══════════════════════════════════════════════════════════════════════════
+            # NETWORK COLUMN (testnet vs mainnet separation) - PostgreSQL
+            # ═══════════════════════════════════════════════════════════════════════════
+            if "network" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN network VARCHAR(32) DEFAULT 'finney' NOT NULL"))
+                conn.commit()
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_speed_submissions_network ON speed_submissions(network)"))
+                conn.commit()
+            result = conn.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'competition_rounds'
+            """))
+            cr_cols = [row[0] for row in result] if result else []
+            if cr_cols and "network" not in cr_cols:
+                conn.execute(text("ALTER TABLE competition_rounds ADD COLUMN network VARCHAR(32) DEFAULT 'finney' NOT NULL"))
+                conn.commit()
+            result = conn.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'miner_scores'
+            """))
+            ms_cols = [row[0] for row in result] if result else []
+            if ms_cols and "network" not in ms_cols:
+                conn.execute(text("ALTER TABLE miner_scores ADD COLUMN network VARCHAR(32) DEFAULT 'finney' NOT NULL"))
+                conn.commit()
+            result = conn.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'miner_registrations'
+            """))
+            mr_cols = [row[0] for row in result] if result else []
+            if mr_cols and "network" not in mr_cols:
+                conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN network VARCHAR(32) DEFAULT 'finney' NOT NULL"))
+                conn.commit()
+            
             # Check if competition_rounds table exists
             result = conn.execute(text("""
                 SELECT EXISTS (
@@ -343,6 +376,39 @@ try:
             if "score" not in columns:
                 conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN score REAL"))
                 conn.commit()
+            
+            # ═══════════════════════════════════════════════════════════════════════════
+            # NETWORK COLUMN (testnet vs mainnet separation) - SQLite
+            # ═══════════════════════════════════════════════════════════════════════════
+            if "network" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN network TEXT DEFAULT 'finney'"))
+                conn.commit()
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_speed_submissions_network ON speed_submissions(network)"))
+                conn.commit()
+            try:
+                result = conn.execute(text("PRAGMA table_info(competition_rounds)"))
+                cr_cols = [row[1] for row in result]
+                if "network" not in cr_cols:
+                    conn.execute(text("ALTER TABLE competition_rounds ADD COLUMN network TEXT DEFAULT 'finney'"))
+                    conn.commit()
+            except Exception:
+                pass
+            try:
+                result = conn.execute(text("PRAGMA table_info(miner_scores)"))
+                ms_cols = [row[1] for row in result]
+                if "network" not in ms_cols:
+                    conn.execute(text("ALTER TABLE miner_scores ADD COLUMN network TEXT DEFAULT 'finney'"))
+                    conn.commit()
+            except Exception:
+                pass
+            try:
+                result = conn.execute(text("PRAGMA table_info(miner_registrations)"))
+                mr_cols = [row[1] for row in result]
+                if "network" not in mr_cols:
+                    conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN network TEXT DEFAULT 'finney'"))
+                    conn.commit()
+            except Exception:
+                pass
             
             # Commit any pending changes
             conn.commit()
@@ -467,19 +533,23 @@ def submit_kernel(
         if req.miner_hotkey != hotkey:
             raise HTTPException(status_code=403, detail="Hotkey mismatch")
 
-        # Check if miner is registered, auto-register if not
+        network = normalize_network(getattr(req, "network", None))
+
+        # Check if miner is registered for this network, auto-register if not
         miner_reg = db.query(models.MinerRegistration).filter(
-            models.MinerRegistration.hotkey == hotkey
+            models.MinerRegistration.hotkey == hotkey,
+            models.MinerRegistration.network == network
         ).first()
 
         if not miner_reg:
             miner_reg = models.MinerRegistration(
                 hotkey=hotkey,
+                network=network,
                 uid=0
             )
             db.add(miner_reg)
             db.commit()
-            print(f"✅ [SUBMIT_KERNEL] Auto-registered miner {hotkey[:8]}... (UID will be synced from metagraph)")
+            print(f"✅ [SUBMIT_KERNEL] Auto-registered miner {hotkey[:8]}... on {network} (UID will be synced from metagraph)")
 
         # Extract IP address from request (for IP banning)
         client_ip = None
@@ -506,11 +576,12 @@ def submit_kernel(
             req.benchmarks
         )
         
-        # Get current round and assign to submission (auto-expires finished rounds)
-        current_round = ensure_current_round(db)
+        # Get current round for this network and assign to submission (auto-expires finished rounds)
+        current_round = ensure_current_round(db, network)
 
         # Create new speed submission
         new_submission = models.SpeedSubmission(
+            network=network,
             miner_hotkey=req.miner_hotkey,
             miner_uid=miner_reg.uid,
             fork_url=req.fork_url,
@@ -607,20 +678,24 @@ def commit_submission(
         # Verify the hotkey matches the authenticated miner
         if req.miner_hotkey != hotkey:
             raise HTTPException(status_code=403, detail="Hotkey mismatch")
+
+        network = normalize_network(getattr(req, "network", None))
         
-        # Check if miner is registered, auto-register if not
+        # Check if miner is registered for this network, auto-register if not
         miner_reg = db.query(models.MinerRegistration).filter(
-            models.MinerRegistration.hotkey == hotkey
+            models.MinerRegistration.hotkey == hotkey,
+            models.MinerRegistration.network == network
         ).first()
         
         if not miner_reg:
             miner_reg = models.MinerRegistration(
                 hotkey=hotkey,
+                network=network,
                 uid=0
             )
             db.add(miner_reg)
             db.commit()
-            print(f"✅ [COMMIT] Auto-registered miner {hotkey[:8]}... (UID will be synced from metagraph)")
+            print(f"✅ [COMMIT] Auto-registered miner {hotkey[:8]}... on {network} (UID will be synced from metagraph)")
         
         # Extract IP address
         client_ip = None
@@ -649,11 +724,12 @@ def commit_submission(
         current_block = get_current_block()
         reveal_block = current_block + BLOCKS_UNTIL_REVEAL
         
-        # Get current round (auto-expires finished rounds)
-        current_round = ensure_current_round(db)
+        # Get current round for this network (auto-expires finished rounds)
+        current_round = ensure_current_round(db, network)
         
         # Create commitment entry (not revealed yet)
         new_submission = models.SpeedSubmission(
+            network=network,
             miner_hotkey=req.miner_hotkey,
             miner_uid=miner_reg.uid,
             target_sequence_length=req.target_sequence_length,
@@ -1013,15 +1089,18 @@ def health_check():
 @app.get("/get_pending_validations")
 def get_pending_validations(
     limit: int = 10,
+    network: Optional[str] = None,
     db: Session = Depends(get_db),
     hotkey: str = Depends(auth.verify_validator_signature)
 ):
     """
-    Validator-only endpoint: Get unvalidated submissions with full details (including fork_url).
+    Validator-only endpoint: Get unvalidated submissions with full details (including fork_url) for the given network.
     Requires validator authentication. fork_url is never exposed to public endpoints.
     """
+    network = normalize_network(network)
     submissions = (
         db.query(models.SpeedSubmission)
+        .filter(models.SpeedSubmission.network == network)
         .filter(models.SpeedSubmission.validated == False)
         .order_by(models.SpeedSubmission.created_at.desc())
         .limit(limit)
@@ -1083,11 +1162,13 @@ def mark_validated(
         try:
             # Determine league from target_sequence_length
             league = get_league_for_seq_len(submission.target_sequence_length)
+            sub_network = getattr(submission, "network", None) or DEFAULT_NETWORK
             
-            # Find existing MinerScore by hotkey + league only (miners register with real model_name)
+            # Find existing MinerScore by hotkey + league + network
             miner_score = db.query(models.MinerScore).filter(
                 models.MinerScore.hotkey == submission.miner_hotkey,
                 models.MinerScore.league == league,
+                models.MinerScore.network == sub_network,
             ).first()
             
             if miner_score:
@@ -1100,14 +1181,16 @@ def mark_validated(
                 print(f"📊 [MINER_SCORES] Updated {submission.miner_hotkey[:8]}... in {league}: score={miner_score.score:.4f}, tasks={miner_score.tasks_completed}")
             else:
                 # Create new MinerScore entry
-                # First, ensure MinerRegistration exists
+                # First, ensure MinerRegistration exists for this network
                 registration = db.query(models.MinerRegistration).filter(
-                    models.MinerRegistration.hotkey == submission.miner_hotkey
+                    models.MinerRegistration.hotkey == submission.miner_hotkey,
+                    models.MinerRegistration.network == sub_network
                 ).first()
                 
                 if not registration:
                     registration = models.MinerRegistration(
                         hotkey=submission.miner_hotkey,
+                        network=sub_network,
                         uid=submission.miner_uid or 0
                     )
                     db.add(registration)
@@ -1117,6 +1200,7 @@ def mark_validated(
                     hotkey=submission.miner_hotkey,
                     model_name="Unknown",
                     league=league,
+                    network=sub_network,
                     score=float(score),
                     tasks_completed=1
                 )
@@ -1163,40 +1247,46 @@ def register_miner(
             detail=f"Invalid league. Must be one of: {', '.join(LEAGUES)}"
         )
 
-    # Check if already registered for this (hotkey, model, league) combo
+    network = normalize_network(getattr(req, "network", None))
+
+    # Check if already registered for this (hotkey, model, league, network) combo
     existing = db.query(models.MinerScore).filter(
         models.MinerScore.hotkey == hotkey,
         models.MinerScore.model_name == req.model_name,
-        models.MinerScore.league == req.league
+        models.MinerScore.league == req.league,
+        models.MinerScore.network == network
     ).first()
 
     miner_uid = req.uid if req.uid is not None else 0
 
     if existing:
-        # Check if MinerRegistration exists, create or update
+        # Check if MinerRegistration exists for this network, create or update
         registration = db.query(models.MinerRegistration).filter(
-            models.MinerRegistration.hotkey == hotkey
+            models.MinerRegistration.hotkey == hotkey,
+            models.MinerRegistration.network == network
         ).first()
 
         if not registration:
             new_registration = models.MinerRegistration(
                 hotkey=hotkey,
+                network=network,
                 uid=miner_uid
             )
             db.add(new_registration)
             db.commit()
-            print(f"✅ [REGISTER] Created missing MinerRegistration for {hotkey[:8]} with UID={miner_uid}")
+            print(f"✅ [REGISTER] Created missing MinerRegistration for {hotkey[:8]} on {network} with UID={miner_uid}")
         elif registration.uid == 0 and miner_uid > 0:
             registration.uid = miner_uid
             db.commit()
-            print(f"✅ [REGISTER] Updated UID for {hotkey[:8]}: 0 -> {miner_uid}")
+            print(f"✅ [REGISTER] Updated UID for {hotkey[:8]} on {network}: 0 -> {miner_uid}")
 
-        print(f"ℹ️ [REGISTER] Miner {hotkey[:8]} already registered for {req.model_name} in {req.league}")
+        print(f"ℹ️ [REGISTER] Miner {hotkey[:8]} already registered for {req.model_name} in {req.league} on {network}")
         return {
             "status": "already_registered",
             "hotkey": hotkey,
             "model_name": req.model_name,
             "league": req.league,
+            "network": network,
             "current_score": existing.score,
             "uid": registration.uid if registration else miner_uid
         }
@@ -1206,59 +1296,69 @@ def register_miner(
         hotkey=hotkey,
         model_name=req.model_name,
         league=req.league,
+        network=network,
         score=0.0,
         tasks_completed=0
     )
     db.add(new_score)
 
-    # Create MinerRegistration entry with actual UID
+    # Create MinerRegistration entry with actual UID for this network
     new_registration = models.MinerRegistration(
         hotkey=hotkey,
+        network=network,
         uid=miner_uid
     )
     db.add(new_registration)
 
     db.commit()
 
-    print(f"✅ [REGISTER] Miner {hotkey[:8]} registered for {req.model_name} in {req.league} with UID={miner_uid}")
+    print(f"✅ [REGISTER] Miner {hotkey[:8]} registered for {req.model_name} in {req.league} on {network} with UID={miner_uid}")
     return {
         "status": "registered",
         "hotkey": hotkey,
         "model_name": req.model_name,
         "league": req.league,
+        "network": network,
         "uid": miner_uid
     }
 
 @app.post("/sync_uids")
 def sync_uids(
-    uid_map: Dict[str, int],
+    req: dict,
     db: Session = Depends(get_db)
 ):
     """
-    Bulk-update miner UIDs from the metagraph.
-    Accepts a dict of {hotkey: uid} and updates all matching MinerRegistration records.
+    Bulk-update miner UIDs from the metagraph for a given network.
+    Body: {"network": "finney"|"test", "uid_map": {hotkey: uid}}.
     Called by validators who have access to the metagraph.
     """
+    network = normalize_network(req.get("network"))
+    uid_map = req.get("uid_map") or req  # allow body to be just the map for backward compat
+    if isinstance(uid_map, dict) and "network" in uid_map and "uid_map" in uid_map:
+        uid_map = uid_map.get("uid_map", {})
+    if not isinstance(uid_map, dict):
+        raise HTTPException(status_code=400, detail="uid_map required (dict of hotkey -> uid)")
     updated = 0
     for hotkey, uid in uid_map.items():
         registration = db.query(models.MinerRegistration).filter(
-            models.MinerRegistration.hotkey == hotkey
+            models.MinerRegistration.hotkey == hotkey,
+            models.MinerRegistration.network == network
         ).first()
         if registration:
             if registration.uid != uid:
                 old_uid = registration.uid
                 registration.uid = uid
                 updated += 1
-                print(f"[SYNC_UIDS] Updated {hotkey[:12]}...: UID {old_uid} -> {uid}")
+                print(f"[SYNC_UIDS] Updated {hotkey[:12]}... on {network}: UID {old_uid} -> {uid}")
         else:
-            new_reg = models.MinerRegistration(hotkey=hotkey, uid=uid)
+            new_reg = models.MinerRegistration(hotkey=hotkey, network=network, uid=uid)
             db.add(new_reg)
             updated += 1
-            print(f"[SYNC_UIDS] Created registration for {hotkey[:12]}... with UID={uid}")
+            print(f"[SYNC_UIDS] Created registration for {hotkey[:12]}... on {network} with UID={uid}")
     
     db.commit()
-    print(f"[SYNC_UIDS] Synced {updated} UIDs from metagraph")
-    return {"status": "ok", "updated": updated, "total_entries": len(uid_map)}
+    print(f"[SYNC_UIDS] Synced {updated} UIDs for network={network}")
+    return {"status": "ok", "updated": updated, "total_entries": len(uid_map), "network": network}
 
 # Updated reward distribution for top 4
 REWARD_DISTRIBUTION = [0.60, 0.25, 0.10, 0.05]  # 60%, 25%, 10%, 5%
@@ -1267,10 +1367,11 @@ TOP_N_MINERS = 4
 @app.get("/get_weights")
 def get_weights(
     round_id: Optional[int] = None,
+    network: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """
-    Get weights for top 4 performers in a specific round.
+    Get weights for top 4 performers in a specific round for the given network.
     
     Reward distribution:
     - 1st place: 60%
@@ -1280,11 +1381,14 @@ def get_weights(
     
     Args:
         round_id: Optional round ID. If not specified, uses the most recent completed round.
+        network: "finney" (mainnet) or "test" (testnet). Default finney.
     """
-    # If round_id not specified, get most recent completed round; fall back to active round
+    network = normalize_network(network)
+    # If round_id not specified, get most recent completed round for this network; fall back to active round
     if round_id is None:
         round_obj = (
             db.query(models.CompetitionRound)
+            .filter(models.CompetitionRound.network == network)
             .filter(models.CompetitionRound.status == "completed")
             .order_by(models.CompetitionRound.round_number.desc())
             .first()
@@ -1292,15 +1396,17 @@ def get_weights(
         if not round_obj:
             round_obj = (
                 db.query(models.CompetitionRound)
+                .filter(models.CompetitionRound.network == network)
                 .filter(models.CompetitionRound.status == "active")
                 .order_by(models.CompetitionRound.round_number.desc())
                 .first()
             )
             if round_obj:
-                print(f"[WEIGHTS] No completed round yet, using active round {round_obj.round_number} for interim weights")
+                print(f"[WEIGHTS] No completed round yet, using active round {round_obj.round_number} for network={network}")
     else:
         round_obj = db.query(models.CompetitionRound).filter(
-            models.CompetitionRound.id == round_id
+            models.CompetitionRound.id == round_id,
+            models.CompetitionRound.network == network
         ).first()
     
     if not round_obj:
@@ -1325,17 +1431,21 @@ def get_weights(
     # For the first round (lowest round_number): no baseline (None)
     # For subsequent rounds: use previous round's baseline_submission_id
     
-    # Find the first round (lowest round_number)
-    first_round = db.query(models.CompetitionRound).order_by(
-        models.CompetitionRound.round_number.asc()
-    ).first()
+    # Find the first round (lowest round_number) for this network
+    first_round = (
+        db.query(models.CompetitionRound)
+        .filter(models.CompetitionRound.network == round_obj.network)
+        .order_by(models.CompetitionRound.round_number.asc())
+        .first()
+    )
     
     if first_round and round_obj.round_number == first_round.round_number:
         # This is the first round - no baseline
         baseline_id = None
     else:
-        # Get previous round's baseline
+        # Get previous round's baseline (same network)
         prev_round = db.query(models.CompetitionRound).filter(
+            models.CompetitionRound.network == round_obj.network,
             models.CompetitionRound.round_number == round_obj.round_number - 1
         ).first()
         baseline_id = prev_round.baseline_submission_id if prev_round else None
@@ -1353,9 +1463,10 @@ def get_weights(
     for i, ranking in enumerate(rankings[:TOP_N_MINERS]):
         weight = REWARD_DISTRIBUTION[i] if i < len(REWARD_DISTRIBUTION) else 0.0
         
-        # Get UID from MinerRegistration if available
+        # Get UID from MinerRegistration for this network
         miner_reg = db.query(models.MinerRegistration).filter(
-            models.MinerRegistration.hotkey == ranking["miner_hotkey"]
+            models.MinerRegistration.hotkey == ranking["miner_hotkey"],
+            models.MinerRegistration.network == round_obj.network
         ).first()
         uid = miner_reg.uid if miner_reg else 0
         
@@ -1404,10 +1515,12 @@ def _finalize_round_impl(round_obj, db):
     db.commit()
 
 
-def ensure_current_round(db):
+def ensure_current_round(db, network: Optional[str] = None):
+    network = normalize_network(network)
     now = datetime.utcnow()
     expired = (
         db.query(models.CompetitionRound)
+        .filter(models.CompetitionRound.network == network)
         .filter(models.CompetitionRound.status == "active")
         .filter(models.CompetitionRound.end_time < now)
         .order_by(models.CompetitionRound.round_number.asc())
@@ -1417,6 +1530,7 @@ def ensure_current_round(db):
         _finalize_round_impl(r, db)
     current_round = (
         db.query(models.CompetitionRound)
+        .filter(models.CompetitionRound.network == network)
         .filter(models.CompetitionRound.status == "active")
         .order_by(models.CompetitionRound.round_number.desc())
         .first()
@@ -1424,12 +1538,14 @@ def ensure_current_round(db):
     if not current_round:
         last_round = (
             db.query(models.CompetitionRound)
+            .filter(models.CompetitionRound.network == network)
             .order_by(models.CompetitionRound.round_number.desc())
             .first()
         )
         next_round_number = (last_round.round_number + 1) if last_round else 1
         current_round = models.CompetitionRound(
             round_number=next_round_number,
+            network=network,
             start_time=now,
             end_time=now + timedelta(hours=48),
             status="active"
@@ -1437,15 +1553,19 @@ def ensure_current_round(db):
         db.add(current_round)
         db.commit()
         db.refresh(current_round)
-        print(f"✅ [ROUND] Created new round #{current_round.round_number}")
+        print(f"✅ [ROUND] Created new round #{current_round.round_number} for network={network}")
     return current_round
 
 
 @app.get("/get_current_round", response_model=models.RoundResponse)
-def get_current_round(db: Session = Depends(get_db)):
-    """Get the current active round. Expires finished rounds and creates a new one if needed."""
+def get_current_round(
+    network: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Get the current active round for the given network. Expires finished rounds and creates a new one if needed."""
     try:
-        current_round = ensure_current_round(db)
+        network = normalize_network(network)
+        current_round = ensure_current_round(db, network)
         now = datetime.utcnow()
         time_remaining = max(0, int((current_round.end_time - now).total_seconds()))
         
@@ -1533,6 +1653,7 @@ def create_round(
         now = datetime.utcnow()
         new_round = models.CompetitionRound(
             round_number=next_round_number,
+            network=network,
             start_time=now,
             end_time=now + timedelta(hours=req.duration_hours),
             status="active",

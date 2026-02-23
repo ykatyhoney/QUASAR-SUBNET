@@ -771,6 +771,7 @@ class Miner(BaseMinerNeuron):
             if self.repo_hash:
                 signature_data += f"{self.repo_hash}"
             
+            network = "test" if str(os.getenv("BT_NETWORK", "finney")).lower() == "test" else "finney"
             payload = {
                 "miner_hotkey": self.wallet.hotkey.ss58_address,
                 "fork_url": fork_url,
@@ -780,7 +781,8 @@ class Miner(BaseMinerNeuron):
                 "tokens_per_sec": target_metrics.get("tokens_per_sec", performance),
                 "vram_mb": float(target_metrics.get("vram_mb", 0.0)),
                 "benchmarks": benchmarks,
-                "signature": self._sign_message(signature_data)
+                "signature": self._sign_message(signature_data),
+                "network": network,
             }
             
             headers = self._get_auth_headers()
