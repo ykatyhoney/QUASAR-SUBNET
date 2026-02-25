@@ -293,6 +293,21 @@ try:
             if mr_cols and "network" not in mr_cols:
                 conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN network VARCHAR(32) DEFAULT 'finney' NOT NULL"))
                 conn.commit()
+            if mr_cols and "coldkey" not in mr_cols:
+                conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN coldkey VARCHAR"))
+                conn.commit()
+            if mr_cols and "is_flagged" not in mr_cols:
+                conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN is_flagged BOOLEAN DEFAULT FALSE"))
+                conn.commit()
+            if mr_cols and "flag_reason" not in mr_cols:
+                conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN flag_reason VARCHAR"))
+                conn.commit()
+            if mr_cols and "github_username" not in mr_cols:
+                conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN github_username VARCHAR"))
+                conn.commit()
+            if mr_cols and "registration_ip" not in mr_cols:
+                conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN registration_ip VARCHAR"))
+                conn.commit()
             
             # Check if competition_rounds table exists
             result = conn.execute(text("""
@@ -427,6 +442,21 @@ try:
                 mr_cols = [row[1] for row in result]
                 if "network" not in mr_cols:
                     conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN network TEXT DEFAULT 'finney'"))
+                    conn.commit()
+                if "coldkey" not in mr_cols:
+                    conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN coldkey TEXT"))
+                    conn.commit()
+                if "is_flagged" not in mr_cols:
+                    conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN is_flagged INTEGER DEFAULT 0"))
+                    conn.commit()
+                if "flag_reason" not in mr_cols:
+                    conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN flag_reason TEXT"))
+                    conn.commit()
+                if "github_username" not in mr_cols:
+                    conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN github_username TEXT"))
+                    conn.commit()
+                if "registration_ip" not in mr_cols:
+                    conn.execute(text("ALTER TABLE miner_registrations ADD COLUMN registration_ip TEXT"))
                     conn.commit()
             except Exception:
                 pass
@@ -594,6 +624,84 @@ def submit_kernel(
                 status_code=403,
                 detail=f"IP address banned: {ban_reason}"
             )
+
+        # ── Anti-spam: flagged miner check ──
+        if miner_reg and miner_reg.is_flagged:
+            print(f"🚫 Flagged miner {hotkey[:12]}... reason: {miner_reg.flag_reason}")
+            raise HTTPException(status_code=403, detail=f"Miner flagged: {miner_reg.flag_reason or 'anti-spam'}")
+
+        # ── Anti-spam: GitHub username dedup ──
+        gh_user = _github_username_from_fork_url(req.fork_url)
+        if gh_user:
+            existing_owner = (
+                db.query(models.MinerRegistration)
+                .filter(
+                    models.MinerRegistration.github_username == gh_user,
+                    models.MinerRegistration.network == network,
+                    models.MinerRegistration.hotkey != hotkey,
+                )
+                .first()
+            )
+            if existing_owner:
+                print(f"🚫 GitHub user '{gh_user}' already claimed by hotkey {existing_owner.hotkey[:12]}... — rejecting {hotkey[:12]}...")
+                if miner_reg and not miner_reg.is_flagged:
+                    miner_reg.is_flagged = True
+                    miner_reg.flag_reason = f"Duplicate GitHub username '{gh_user}' (original: {existing_owner.hotkey[:12]}...)"
+                    db.commit()
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"GitHub username '{gh_user}' is already registered to a different hotkey. One hotkey per GitHub account."
+                )
+            if miner_reg and not miner_reg.github_username:
+                miner_reg.github_username = gh_user
+                db.commit()
+
+        # IP registration dedup ──
+        if client_ip and miner_reg:
+            if not miner_reg.registration_ip:
+                miner_reg.registration_ip = client_ip
+                db.commit()
+            other_ip_reg = (
+                db.query(models.MinerRegistration)
+                .filter(
+                    models.MinerRegistration.registration_ip == client_ip,
+                    models.MinerRegistration.network == network,
+                    models.MinerRegistration.hotkey != hotkey,
+                )
+                .first()
+            )
+            if other_ip_reg:
+                print(f"🚫 IP {client_ip} already used by hotkey {other_ip_reg.hotkey[:12]}... — rejecting {hotkey[:12]}...")
+                if miner_reg and not miner_reg.is_flagged:
+                    miner_reg.is_flagged = True
+                    miner_reg.flag_reason = f"Duplicate IP {client_ip} (original: {other_ip_reg.hotkey[:12]}...)"
+                    db.commit()
+                raise HTTPException(
+                    status_code=403,
+                    detail="This IP address is already associated with a different hotkey. One hotkey per IP."
+                )
+
+        # ── Anti-spam: coldkey dedup (one hotkey per coldkey) ──
+        if miner_reg and miner_reg.coldkey:
+            other_coldkey_reg = (
+                db.query(models.MinerRegistration)
+                .filter(
+                    models.MinerRegistration.coldkey == miner_reg.coldkey,
+                    models.MinerRegistration.network == network,
+                    models.MinerRegistration.hotkey != hotkey,
+                )
+                .first()
+            )
+            if other_coldkey_reg:
+                print(f"🚫 Coldkey {miner_reg.coldkey[:12]}... already used by hotkey {other_coldkey_reg.hotkey[:12]}... — rejecting {hotkey[:12]}...")
+                if not miner_reg.is_flagged:
+                    miner_reg.is_flagged = True
+                    miner_reg.flag_reason = f"Duplicate coldkey (original: {other_coldkey_reg.hotkey[:12]}...)"
+                    db.commit()
+                raise HTTPException(
+                    status_code=403,
+                    detail="This coldkey already has a registered hotkey. One hotkey per coldkey."
+                )
 
         # Calculate solution hash for duplicate detection
         solution_hash = calculate_solution_hash(
@@ -857,6 +965,33 @@ def reveal_submission(
                 detail="Commitment verification failed. Hash mismatch."
             )
         
+        # GitHub username dedup (at reveal time)
+        network = normalize_network(getattr(submission, "network", None))
+        gh_user = _github_username_from_fork_url(req.fork_url)
+        if gh_user:
+            existing_owner = (
+                db.query(models.MinerRegistration)
+                .filter(
+                    models.MinerRegistration.github_username == gh_user,
+                    models.MinerRegistration.network == network,
+                    models.MinerRegistration.hotkey != hotkey,
+                )
+                .first()
+            )
+            if existing_owner:
+                print(f"🚫 [ANTI-SPAM] GitHub user '{gh_user}' already claimed by hotkey {existing_owner.hotkey[:12]}... — rejecting reveal from {hotkey[:12]}...")
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"GitHub username '{gh_user}' is already registered to a different hotkey. One hotkey per GitHub account."
+                )
+            miner_reg = db.query(models.MinerRegistration).filter(
+                models.MinerRegistration.hotkey == hotkey,
+                models.MinerRegistration.network == network
+            ).first()
+            if miner_reg and not miner_reg.github_username:
+                miner_reg.github_username = gh_user
+                db.commit()
+
         # Calculate solution hash for duplicate detection
         solution_hash = calculate_solution_hash(
             req.tokens_per_sec,
@@ -1354,16 +1489,17 @@ def sync_uids(
     db: Session = Depends(get_db)
 ):
     """
-    Bulk-update miner UIDs from the metagraph for a given network.
-    Body: {"network": "finney"|"test", "uid_map": {hotkey: uid}}.
+    Bulk-update miner UIDs and coldkeys from the metagraph for a given network.
+    Body: {"network": "finney"|"test", "uid_map": {hotkey: uid}, "coldkey_map": {hotkey: coldkey}}.
     Called by validators who have access to the metagraph.
     """
     network = normalize_network(req.get("network"))
-    uid_map = req.get("uid_map") or req  # allow body to be just the map for backward compat
+    uid_map = req.get("uid_map") or req
     if isinstance(uid_map, dict) and "network" in uid_map and "uid_map" in uid_map:
         uid_map = uid_map.get("uid_map", {})
     if not isinstance(uid_map, dict):
         raise HTTPException(status_code=400, detail="uid_map required (dict of hotkey -> uid)")
+    coldkey_map = req.get("coldkey_map") or {}
     updated = 0
     for hotkey, uid in uid_map.items():
         registration = db.query(models.MinerRegistration).filter(
@@ -1371,13 +1507,24 @@ def sync_uids(
             models.MinerRegistration.network == network
         ).first()
         if registration:
+            changed = False
             if registration.uid != uid:
                 old_uid = registration.uid
                 registration.uid = uid
-                updated += 1
+                changed = True
                 print(f"[SYNC_UIDS] Updated {hotkey[:12]}... on {network}: UID {old_uid} -> {uid}")
+            ck = coldkey_map.get(hotkey)
+            if ck and registration.coldkey != ck:
+                registration.coldkey = ck
+                changed = True
+                print(f"[SYNC_UIDS] Updated coldkey for {hotkey[:12]}... on {network}")
+            if changed:
+                updated += 1
         else:
-            new_reg = models.MinerRegistration(hotkey=hotkey, network=network, uid=uid)
+            new_reg = models.MinerRegistration(
+                hotkey=hotkey, network=network, uid=uid,
+                coldkey=coldkey_map.get(hotkey)
+            )
             db.add(new_reg)
             updated += 1
             print(f"[SYNC_UIDS] Created registration for {hotkey[:12]}... on {network} with UID={uid}")
@@ -1385,6 +1532,65 @@ def sync_uids(
     db.commit()
     print(f"[SYNC_UIDS] Synced {updated} UIDs for network={network}")
     return {"status": "ok", "updated": updated, "total_entries": len(uid_map), "network": network}
+
+
+@app.get("/flagged_miners")
+def get_flagged_miners(
+    network: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """List all miners flagged by spam checks."""
+    network = normalize_network(network)
+    flagged = (
+        db.query(models.MinerRegistration)
+        .filter(
+            models.MinerRegistration.network == network,
+            models.MinerRegistration.is_flagged == True,
+        )
+        .all()
+    )
+    return {
+        "network": network,
+        "count": len(flagged),
+        "flagged": [
+            {
+                "hotkey": r.hotkey,
+                "uid": r.uid,
+                "coldkey": r.coldkey,
+                "github_username": r.github_username,
+                "registration_ip": r.registration_ip,
+                "flag_reason": r.flag_reason,
+            }
+            for r in flagged
+        ],
+    }
+
+
+@app.post("/flag_miner")
+def flag_miner(
+    req: dict,
+    db: Session = Depends(get_db)
+):
+    """Manually flag or unflag a miner. Body: {"hotkey": str, "network": str, "flag": bool, "reason": str}."""
+    hotkey = req.get("hotkey")
+    if not hotkey:
+        raise HTTPException(status_code=400, detail="hotkey required")
+    network = normalize_network(req.get("network"))
+    flag = req.get("flag", True)
+    reason = req.get("reason", "Manual flag")
+    reg = db.query(models.MinerRegistration).filter(
+        models.MinerRegistration.hotkey == hotkey,
+        models.MinerRegistration.network == network,
+    ).first()
+    if not reg:
+        raise HTTPException(status_code=404, detail="Miner not found")
+    reg.is_flagged = flag
+    reg.flag_reason = reason if flag else None
+    db.commit()
+    action = "flagged" if flag else "unflagged"
+    print(f"[FLAG] Miner {hotkey[:12]}... {action} on {network}: {reason}")
+    return {"status": action, "hotkey": hotkey, "network": network}
+
 
 # Updated reward distribution for top 4
 REWARD_DISTRIBUTION = [0.60, 0.25, 0.10, 0.05]  # 60%, 25%, 10%, 5%

@@ -57,6 +57,11 @@ class MinerRegistration(Base):
     hotkey = Column(String, nullable=False, index=True)
     network = Column(String, default=DEFAULT_NETWORK, nullable=False, index=True)  # "finney" or "test"
     uid = Column(Integer, nullable=False)
+    coldkey = Column(String, nullable=True, index=True)
+    github_username = Column(String, nullable=True, index=True)
+    registration_ip = Column(String, nullable=True, index=True)
+    is_flagged = Column(Boolean, default=False)
+    flag_reason = Column(String, nullable=True)
     registered_at = Column(Integer, nullable=False, default=lambda: int(datetime.utcnow().timestamp()))
     last_seen = Column(Integer, nullable=False, default=lambda: int(datetime.utcnow().timestamp()))
 
