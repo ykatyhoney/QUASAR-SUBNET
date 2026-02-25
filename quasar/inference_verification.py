@@ -7,28 +7,23 @@
 # This module implements:
 # - Reference model for logit comparison
 # - Logit verification (cosine similarity + max absolute diff)
-# - Commit-reveal mechanism for Docker image submissions
+# - Container execution via Docker SDK for miner submissions
 # - Throughput-based scoring with verification gate
 
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                    QUASAR - INFERENCE VERIFICATION                           ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║                                                                              ║
-║  MECHANISM                                                                   ║
-║  ─────────                                                                   ║
-║  Miners submit Docker images exposing an inference server. Validators run   ║
-║  containers, measuring generation throughput while verifying correctness    ║
-║  by comparing logits at a random decode step.                               ║
-║                                                                              ║
-║  Container interface: inference(prompt, gen_len, logits_at_step)            ║
-║  → Returns: {tokens, captured_logits, elapsed_sec}                          ║
-║                                                                              ║
-║  Verification: cosine similarity + max absolute diff on captured logits     ║
-║  Scoring: throughput (tok/sec) if verified, infinity if failed              ║
-║  Leader: epsilon-dominance, winner-take-all weights                         ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+Inference verification for QUASAR-SUBNET.
+
+Miners submit Docker images exposing an inference server. Validators run
+containers, measuring generation throughput while verifying correctness
+by comparing logits at a random decode step.
+
+Container interface: POST /inference
+  Request:  {prompt: List[int], gen_len: int, logits_at_step: int}
+  Response: {tokens: List[int], captured_logits: List[float], elapsed_sec: float}
+
+Verification: cosine similarity + max absolute diff on captured logits
+Scoring: throughput (tok/sec) if verified, infinity if failed
+Leader: epsilon-dominance, winner-take-all weights
 """
 
 import os
@@ -38,6 +33,7 @@ import numpy as np
 import torch
 import time
 import hashlib
+import socket
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -50,31 +46,31 @@ from dataclasses import dataclass, field
 @dataclass
 class InferenceVerificationConfig:
     """Configuration for inference verification."""
-    
+
     # Network configuration
     netuid: int = int(os.environ.get("NETUID", 383))
-    
+
     # Reference model (DeepSeek-V3.2 for better code understanding and verification)
     reference_model: str = os.environ.get("REFERENCE_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
-    
+
     # Inference configuration
     prompt_length: int = 128  # Random prompt token length
     generate_length: int = 512  # Number of tokens to generate
     logit_capture_range: Tuple[int, int] = (1, 50)  # Range for random logit capture step
     inference_timeout: int = 300  # Timeout in seconds
-    
+
     # Verification thresholds (from const's implementation)
     cosine_sim_threshold: float = 0.99  # Minimum cosine similarity
     max_abs_diff_threshold: float = 0.1  # Maximum absolute difference
-    
+
     # Commit-reveal timing
     blocks_until_reveal: int = 100  # ~20 minutes (100 blocks * 12s/block)
     block_time: int = 12  # Bittensor block time in seconds
-    
+
     # Scoring parameters
     epsilon: float = 0.01  # Epsilon for dominance comparison
     tempo: int = 360  # Weight update interval in blocks
-    
+
     # Defaults
     default_wallet: str = os.environ.get("WALLET_NAME", "default")
     default_hotkey: str = os.environ.get("HOTKEY_NAME", "default")
@@ -93,20 +89,21 @@ def log(msg: str, level: str = "info"):
     """Colored logging output."""
     ts = datetime.now().strftime("%H:%M:%S")
     colors = {
-        "info": "\033[36m▸\033[0m",      # Cyan
-        "success": "\033[32m✓\033[0m",   # Green
-        "error": "\033[31m✗\033[0m",     # Red
-        "warn": "\033[33m⚠\033[0m",      # Yellow
-        "start": "\033[33m→\033[0m",     # Yellow arrow
+        "info": "\033[36m\u25b8\033[0m",      # Cyan
+        "success": "\033[32m\u2713\033[0m",   # Green
+        "error": "\033[31m\u2717\033[0m",     # Red
+        "warn": "\033[33m\u26a0\033[0m",      # Yellow
+        "start": "\033[33m\u2192\033[0m",     # Yellow arrow
     }
     print(f"\033[90m{ts}\033[0m {colors.get(level, ' ')} {msg}")
 
 
 def log_header(title: str):
     """Log a section header."""
-    print(f"\n\033[1m{'─' * 60}\033[0m")
+    sep = "\u2500" * 60
+    print(f"\n\033[1m{sep}\033[0m")
     print(f"\033[1m{title}\033[0m")
-    print(f"\033[1m{'─' * 60}\033[0m\n")
+    print(f"\033[1m{sep}\033[0m\n")
 
 
 # ╔════════════════════════════════════════════════════════════════════════════╗
@@ -120,7 +117,7 @@ class VerificationResult:
     cosine_sim: Optional[float] = None
     max_abs_diff: Optional[float] = None
     reason: Optional[str] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "verified": self.verified,
@@ -131,56 +128,40 @@ class VerificationResult:
 
 
 def verify_logits(
-    miner_logits: List[float], 
+    miner_logits: List[float],
     reference_logits: List[float],
     cosine_threshold: float = CONFIG.cosine_sim_threshold,
     max_diff_threshold: float = CONFIG.max_abs_diff_threshold
 ) -> VerificationResult:
     """
     Compare miner's logits against reference within tolerance.
-    
+
     Uses cosine similarity + max absolute difference as verification metrics.
     This handles numerical instability that would cause divergence with
     direct logit comparison.
-    
-    Args:
-        miner_logits: Logits returned by miner at the capture step
-        reference_logits: Logits from reference model at same step
-        cosine_threshold: Minimum cosine similarity required (default: 0.99)
-        max_diff_threshold: Maximum absolute difference allowed (default: 0.1)
-    
-    Returns:
-        VerificationResult with verified status and metrics
     """
     miner = np.array(miner_logits, dtype=np.float32)
     reference = np.array(reference_logits, dtype=np.float32)
-    
-    # Check shape match
+
     if miner.shape != reference.shape:
         return VerificationResult(
             verified=False,
             reason=f"shape_mismatch: miner={miner.shape}, reference={reference.shape}"
         )
-    
-    # Check for zero norms (would cause division by zero)
+
     norm_m = np.linalg.norm(miner)
     norm_r = np.linalg.norm(reference)
-    
+
     if norm_m < 1e-9 or norm_r < 1e-9:
         return VerificationResult(
             verified=False,
             reason="zero_norm: logit vectors have near-zero norm"
         )
-    
-    # Calculate cosine similarity
+
     cosine_sim = float(np.dot(miner, reference) / (norm_m * norm_r))
-    
-    # Calculate max absolute difference
     max_abs_diff = float(np.max(np.abs(miner - reference)))
-    
-    # Verify against thresholds
     verified = (cosine_sim >= cosine_threshold) and (max_abs_diff <= max_diff_threshold)
-    
+
     return VerificationResult(
         verified=verified,
         cosine_sim=cosine_sim,
@@ -196,34 +177,24 @@ def compute_kl_divergence(
 ) -> float:
     """
     Compute KL divergence between miner and reference logit distributions.
-    
-    Alternative verification method mentioned by const:
+
+    Alternative verification method:
     "validator gives zero score if KL > epsilon"
-    
-    Args:
-        miner_logits: Logits from miner
-        reference_logits: Logits from reference model
-        temperature: Temperature for softmax (default: 1.0)
-    
-    Returns:
-        KL divergence value (lower is better, 0 = identical)
     """
     import torch.nn.functional as F
-    
+
     miner_t = torch.tensor(miner_logits, dtype=torch.float32)
     reference_t = torch.tensor(reference_logits, dtype=torch.float32)
-    
-    # Apply temperature and softmax
+
     miner_probs = F.softmax(miner_t / temperature, dim=-1)
     reference_probs = F.softmax(reference_t / temperature, dim=-1)
-    
-    # KL divergence: D_KL(reference || miner)
+
     kl_div = F.kl_div(
         miner_probs.log(),
         reference_probs,
         reduction='sum'
     )
-    
+
     return float(kl_div)
 
 
@@ -234,104 +205,85 @@ def compute_kl_divergence(
 class ReferenceModel:
     """
     Reference model for inference verification.
-    
-    Runs the honest base model (Qwen/Qwen2.5-0.5B-Instruct) to produce
-    ground-truth logits for comparison with miner outputs.
+
+    Runs the honest base model to produce ground-truth logits for comparison
+    with miner outputs.
     """
-    
+
     def __init__(self, model_name: str = CONFIG.reference_model):
         self.model_name = model_name
         self.model = None
         self.tokenizer = None
         self.device = None
         self._loaded = False
-    
+
     async def load(self):
         """Load the reference model and tokenizer."""
         if self._loaded:
             return
-        
+
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        
+
         log(f"Loading reference model: {self.model_name}", "info")
-        
-        # Load tokenizer
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
             trust_remote_code=True
         )
-        
-        # Determine device
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Load model
+
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map="auto" if torch.cuda.is_available() else None,
             trust_remote_code=True
         )
-        
+
         if not torch.cuda.is_available():
             self.model = self.model.to(self.device)
-        
+
         self.model.eval()
         self._loaded = True
-        
+
         log(f"Reference model loaded on {self.device}", "success")
-    
+
     async def inference(
-        self, 
-        prompt: List[int], 
-        gen_len: int, 
+        self,
+        prompt: List[int],
+        gen_len: int,
         logits_at_step: int
     ) -> Dict[str, Any]:
         """
         Run inference and capture logits at a specific step.
-        
-        This is the core of the verification mechanism. The validator runs
-        the same inference as the miner and compares logits at a random step.
-        
-        Args:
-            prompt: Input token IDs (random tokens for verification)
-            gen_len: Number of tokens to generate
-            logits_at_step: Step at which to capture logits (1-indexed)
-        
-        Returns:
-            Dict with:
-                - tokens: List of generated token IDs
-                - captured_logits: Logits at the specified step
-                - elapsed_sec: Time taken for inference
+
+        The validator runs the same inference as the miner and compares
+        logits at a random step.
         """
         if not self._loaded:
             await self.load()
-        
+
         device = next(self.model.parameters()).device
         input_ids = torch.tensor([prompt], device=device)
-        
+
         generated_tokens = []
         captured_logits = None
         past_key_values = None
-        
+
         start_time = time.perf_counter()
-        
+
         with torch.no_grad():
-            # Initial forward pass (prefill)
             outputs = self.model(input_ids, use_cache=True)
             past_key_values = outputs.past_key_values
             next_token_logits = outputs.logits[:, -1, :]
-            
-            # Autoregressive generation
+
             for step in range(gen_len):
-                # Capture logits at the specified step (1-indexed)
                 if step + 1 == logits_at_step:
                     captured_logits = next_token_logits[0].cpu().float().tolist()
-                
-                # Greedy decoding (argmax)
+
                 next_token = next_token_logits.argmax(dim=-1)
                 generated_tokens.append(next_token.item())
-                
-                # Forward pass with KV cache
+
                 outputs = self.model(
                     next_token.unsqueeze(0),
                     past_key_values=past_key_values,
@@ -339,15 +291,15 @@ class ReferenceModel:
                 )
                 past_key_values = outputs.past_key_values
                 next_token_logits = outputs.logits[:, -1, :]
-        
+
         elapsed_sec = time.perf_counter() - start_time
-        
+
         return {
             "tokens": generated_tokens,
             "captured_logits": captured_logits,
             "elapsed_sec": elapsed_sec
         }
-    
+
     def get_vocab_size(self) -> int:
         """Get vocabulary size for logit dimension verification."""
         if self.tokenizer is None:
@@ -362,18 +314,10 @@ class ReferenceModel:
 def generate_random_prompt(length: int, vocab_size: int = 32000) -> List[int]:
     """
     Generate a random prompt for inference verification.
-    
+
     Using random tokens ensures miners can't pre-compute responses
     and must actually run the model.
-    
-    Args:
-        length: Number of tokens in the prompt
-        vocab_size: Vocabulary size to sample from
-    
-    Returns:
-        List of random token IDs
     """
-    # Avoid special tokens (typically 0-10 range)
     return [random.randint(10, vocab_size - 1) for _ in range(length)]
 
 
@@ -381,17 +325,9 @@ def generate_verification_challenge(
     reference_model: ReferenceModel,
     config: InferenceVerificationConfig = CONFIG
 ) -> Dict[str, Any]:
-    """
-    Generate a verification challenge for a miner.
-    
-    Returns:
-        Dict with:
-            - prompt: Random token IDs
-            - gen_len: Generation length
-            - logits_at_step: Step to capture logits
-    """
+    """Generate a verification challenge for a miner."""
     vocab_size = reference_model.get_vocab_size() or 32000
-    
+
     return {
         "prompt": generate_random_prompt(config.prompt_length, vocab_size),
         "gen_len": config.generate_length,
@@ -400,8 +336,16 @@ def generate_verification_challenge(
 
 
 # ╔════════════════════════════════════════════════════════════════════════════╗
-# ║ CONTAINER EXECUTION                                                        ║
+# ║ CONTAINER EXECUTION (Docker SDK)                                           ║
 # ╚════════════════════════════════════════════════════════════════════════════╝
+
+CONTAINER_INTERNAL_PORT = 8000
+CONTAINER_STARTUP_TIMEOUT = int(os.environ.get("CONTAINER_STARTUP_TIMEOUT", "120"))
+CONTAINER_PULL_TIMEOUT = int(os.environ.get("CONTAINER_PULL_TIMEOUT", "600"))
+CONTAINER_GPU_ENABLED = os.environ.get("CONTAINER_GPU_ENABLED", "true").lower() == "true"
+CONTAINER_MEMORY_LIMIT = os.environ.get("CONTAINER_MEMORY_LIMIT", "16g")
+CONTAINER_SHM_SIZE = os.environ.get("CONTAINER_SHM_SIZE", "2g")
+
 
 @dataclass
 class ContainerInferenceResult:
@@ -411,7 +355,7 @@ class ContainerInferenceResult:
     captured_logits: Optional[List[float]] = None
     elapsed_sec: float = 0.0
     error: Optional[str] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "success": self.success,
@@ -422,83 +366,174 @@ class ContainerInferenceResult:
         }
 
 
-async def run_container_inference(
+def _find_free_port() -> int:
+    """Find a free TCP port on the host."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_container_health(
+    host_port: int,
+    timeout: int = CONTAINER_STARTUP_TIMEOUT,
+    poll_interval: float = 2.0,
+) -> bool:
+    """Poll the container's /health endpoint until it responds or timeout."""
+    import requests as _requests
+
+    url = f"http://127.0.0.1:{host_port}/health"
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            r = _requests.get(url, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("status") == "healthy":
+                    return True
+        except Exception as e:
+            last_err = e
+        time.sleep(poll_interval)
+    if last_err:
+        log(f"Last health-check error: {last_err}", "warn")
+    return False
+
+
+def run_container_inference(
     hotkey: str,
     docker_image: str,
     prompt: List[int],
     gen_len: int,
     logits_at_step: int,
-    timeout: int = CONFIG.inference_timeout
+    timeout: int = CONFIG.inference_timeout,
+    gpu_enabled: bool = CONTAINER_GPU_ENABLED,
 ) -> ContainerInferenceResult:
     """
-    Run inference on miner's Docker container.
-    
-    This would use affinetes/Basilica to execute the container.
-    For now, this is a placeholder that should be integrated with
-    the actual container execution system.
-    
-    Container interface expected:
-        inference(prompt: List[int], gen_len: int, logits_at_step: int)
-        → Returns: {tokens: List[int], captured_logits: List[float], elapsed_sec: float}
-    
-    Args:
-        hotkey: Miner's hotkey for identification
-        docker_image: Docker image to run
-        prompt: Input token IDs
-        gen_len: Number of tokens to generate
-        logits_at_step: Step at which to capture logits
-        timeout: Timeout in seconds
-    
-    Returns:
-        ContainerInferenceResult with inference results or error
+    Run inference on a miner's Docker container via the Docker SDK.
+
+    Lifecycle:
+        1. Pull the image (if not cached locally).
+        2. Start a container mapping an ephemeral host port to 8000.
+        3. Wait for /health to report "healthy".
+        4. POST /inference with the challenge payload.
+        5. Parse the response into a ContainerInferenceResult.
+        6. Always stop and remove the container in the finally block.
+
+    The miner container must expose a FastAPI server on port 8000 with:
+        POST /inference  -> {tokens, captured_logits, elapsed_sec}
+        GET  /health     -> {status: "healthy", ...}
     """
-    env = None
+    import requests as _requests
+
     try:
-        # Try to import affinetes for container execution
+        import docker as _docker
+    except ImportError:
+        log("docker SDK not installed - run: pip install docker", "error")
+        return ContainerInferenceResult(
+            success=False, error="docker python SDK not installed"
+        )
+
+    container = None
+    client = None
+    host_port = _find_free_port()
+
+    try:
+        client = _docker.from_env()
+
+        # 1. Pull image
+        log(f"Pulling image {docker_image} for {hotkey[:12]}...", "start")
         try:
-            import affinetes as af
-        except ImportError:
-            log(f"affinetes not installed - using mock container execution", "warn")
-            # Return mock result for testing
+            client.images.pull(docker_image)
+            log(f"Image ready: {docker_image}", "success")
+        except _docker.errors.ImageNotFound:
+            return ContainerInferenceResult(
+                success=False, error=f"image not found: {docker_image}"
+            )
+        except _docker.errors.APIError as e:
+            return ContainerInferenceResult(
+                success=False, error=f"docker pull failed: {e}"
+            )
+
+        # 2. Start container
+        run_kwargs: Dict[str, Any] = {
+            "image": docker_image,
+            "detach": True,
+            "auto_remove": False,
+            "ports": {f"{CONTAINER_INTERNAL_PORT}/tcp": host_port},
+            "environment": {"DEVICE": "cuda" if gpu_enabled else "cpu"},
+            "mem_limit": CONTAINER_MEMORY_LIMIT,
+            "shm_size": CONTAINER_SHM_SIZE,
+            "labels": {
+                "quasar.hotkey": hotkey,
+                "quasar.role": "miner-verification",
+            },
+            "name": f"quasar-verify-{hotkey[:12]}-{int(time.time())}",
+        }
+        if gpu_enabled:
+            run_kwargs["device_requests"] = [
+                _docker.types.DeviceRequest(count=1, capabilities=[["gpu"]])
+            ]
+
+        log(f"Starting container on host port {host_port}...", "start")
+        container = client.containers.run(**run_kwargs)
+
+        # 3. Wait for health
+        log("Waiting for container health...", "info")
+        healthy = _wait_for_container_health(host_port, timeout=CONTAINER_STARTUP_TIMEOUT)
+        if not healthy:
+            logs_tail = ""
+            try:
+                logs_tail = container.logs(tail=40).decode(errors="replace")
+            except Exception:
+                pass
             return ContainerInferenceResult(
                 success=False,
-                error="affinetes not installed - container execution not available"
+                error=(
+                    f"container did not become healthy within "
+                    f"{CONTAINER_STARTUP_TIMEOUT}s. Logs:\n{logs_tail}"
+                ),
             )
-        
-        # Load container environment
-        env = af.load_env(image=docker_image)
-        
-        # Call inference function in container
-        result = await env.inference(
-            prompt=prompt,
-            gen_len=gen_len,
-            logits_at_step=logits_at_step,
-            _timeout=timeout
-        )
-        
+        log("Container healthy", "success")
+
+        # 4. Call /inference
+        inference_url = f"http://127.0.0.1:{host_port}/inference"
+        payload = {
+            "prompt": prompt,
+            "gen_len": gen_len,
+            "logits_at_step": logits_at_step,
+        }
+        log(f"Calling /inference (timeout={timeout}s)...", "info")
+        resp = _requests.post(inference_url, json=payload, timeout=timeout)
+        if resp.status_code != 200:
+            return ContainerInferenceResult(
+                success=False,
+                error=f"/inference returned HTTP {resp.status_code}: {resp.text[:500]}",
+            )
+
+        data = resp.json()
         return ContainerInferenceResult(
             success=True,
-            tokens=result.get("tokens", []),
-            captured_logits=result.get("captured_logits"),
-            elapsed_sec=float(result.get("elapsed_sec", 0))
+            tokens=data.get("tokens", []),
+            captured_logits=data.get("captured_logits"),
+            elapsed_sec=float(data.get("elapsed_sec", 0)),
         )
-        
-    except asyncio.TimeoutError:
-        log(f"Container timeout for {hotkey[:8]}...", "error")
-        return ContainerInferenceResult(
-            success=False,
-            error=f"timeout after {timeout}s"
-        )
+
     except Exception as e:
-        log(f"Container failed for {hotkey[:8]}...: {e}", "error")
-        return ContainerInferenceResult(
-            success=False,
-            error=str(e)
-        )
+        log(f"Container execution failed for {hotkey[:8]}...: {e}", "error")
+        return ContainerInferenceResult(success=False, error=str(e))
     finally:
-        if env:
+        if container is not None:
             try:
-                await env.cleanup()
+                container.stop(timeout=10)
+            except Exception:
+                pass
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+        if client is not None:
+            try:
+                client.close()
             except Exception:
                 pass
 
@@ -518,7 +553,7 @@ class MinerEvaluation:
     throughput: float = 0.0  # tokens/sec
     verification: Optional[VerificationResult] = None
     error: Optional[str] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "hotkey": self.hotkey,
@@ -540,50 +575,40 @@ async def evaluate_miner(
 ) -> MinerEvaluation:
     """
     Evaluate a miner: verify correctness + measure throughput.
-    
-    This is the core evaluation function that:
-    1. Generates a random prompt
-    2. Runs inference on miner's container
-    3. Runs inference on reference model
-    4. Compares logits at random step
-    5. Calculates throughput if verified
-    
-    Args:
-        hotkey: Miner's hotkey
-        docker_image: Miner's Docker image
-        reference: Reference model instance
-        config: Configuration
-    
-    Returns:
-        MinerEvaluation with score and verification results
+
+    1. Generate a random prompt
+    2. Run inference on miner's container (synchronous Docker call)
+    3. Run inference on reference model
+    4. Compare logits at random step
+    5. Calculate throughput if verified
     """
-    # Generate challenge
     challenge = generate_verification_challenge(reference, config)
     prompt = challenge["prompt"]
     gen_len = challenge["gen_len"]
     logits_at_step = challenge["logits_at_step"]
-    
+
     log(f"  prompt_len={len(prompt)}, gen_len={gen_len}, capture_step={logits_at_step}", "info")
-    
-    # Run miner inference
-    miner_result = await run_container_inference(
-        hotkey, docker_image, prompt, gen_len, logits_at_step
+
+    # run_container_inference is synchronous (Docker SDK); run in thread to
+    # avoid blocking the event loop if called from an async context.
+    loop = asyncio.get_event_loop()
+    miner_result = await loop.run_in_executor(
+        None,
+        lambda: run_container_inference(hotkey, docker_image, prompt, gen_len, logits_at_step),
     )
-    
+
     if not miner_result.success:
         return MinerEvaluation(
             hotkey=hotkey,
-            block=0,  # Will be set by caller
+            block=0,
             docker_image=docker_image,
             score=float("inf"),
             verified=False,
             error=miner_result.error
         )
-    
-    # Run reference model inference
+
     reference_result = await reference.inference(prompt, gen_len, logits_at_step)
-    
-    # Check if miner returned logits
+
     if miner_result.captured_logits is None:
         log("  Miner did not return captured logits", "error")
         return MinerEvaluation(
@@ -594,15 +619,14 @@ async def evaluate_miner(
             verified=False,
             error="no_logits"
         )
-    
-    # Verify logits
+
     verification = verify_logits(
         miner_result.captured_logits,
         reference_result["captured_logits"]
     )
-    
+
     log(f"  cosine={verification.cosine_sim:.4f}, max_diff={verification.max_abs_diff:.4f}", "info")
-    
+
     if not verification.verified:
         log("  FAILED verification", "error")
         return MinerEvaluation(
@@ -613,8 +637,7 @@ async def evaluate_miner(
             verified=False,
             verification=verification
         )
-    
-    # Calculate throughput
+
     elapsed = miner_result.elapsed_sec
     if elapsed <= 0:
         return MinerEvaluation(
@@ -625,12 +648,12 @@ async def evaluate_miner(
             verified=True,
             error="invalid_elapsed"
         )
-    
+
     throughput = gen_len / elapsed
     score = 1.0 / throughput if throughput > 0 else float("inf")
-    
+
     log(f"  Throughput: {throughput:.1f} tok/sec", "success")
-    
+
     return MinerEvaluation(
         hotkey=hotkey,
         block=0,
@@ -648,18 +671,7 @@ def beats(
     j: str,
     epsilon: float = CONFIG.epsilon
 ) -> bool:
-    """
-    Check if miner i beats miner j with epsilon-dominance.
-    
-    Args:
-        evaluations: Dictionary of miner evaluations
-        i: Hotkey of miner i
-        j: Hotkey of miner j
-        epsilon: Epsilon for dominance comparison
-    
-    Returns:
-        True if i beats j
-    """
+    """Check if miner i beats miner j with epsilon-dominance."""
     if i not in evaluations or j not in evaluations:
         return False
     return evaluations[i].score < evaluations[j].score - epsilon
@@ -671,39 +683,26 @@ def select_leader(
 ) -> Optional[str]:
     """
     Select leader using epsilon-dominance.
-    
-    The leader is the miner that:
-    1. Is verified (passed logit check)
-    2. Is not dominated by any other verified miner
-    3. Has the earliest submission block (tie-breaker)
-    
-    Args:
-        evaluations: Dictionary of miner evaluations
-        epsilon: Epsilon for dominance comparison
-    
-    Returns:
-        Hotkey of the leader, or None if no valid leader
+
+    The leader is the verified miner that is not dominated by any other
+    verified miner. Tie-breaker: earliest submission block.
     """
     if not evaluations:
         return None
-    
-    # Filter to verified miners only
+
     verified = [hk for hk in evaluations if evaluations[hk].verified]
     if not verified:
         return None
-    
-    # Find non-dominated candidates
+
     candidates = []
     for hk in verified:
-        # Check if any other miner beats this one
         dominated = any(beats(evaluations, other, hk, epsilon) for other in verified if other != hk)
         if not dominated:
             candidates.append(hk)
-    
+
     if not candidates:
         return None
-    
-    # Tie-breaker: earliest submission block
+
     return min(candidates, key=lambda hk: evaluations[hk].block)
 
 
@@ -713,25 +712,18 @@ def calculate_weights(
 ) -> Dict[str, float]:
     """
     Calculate weights for all miners (winner-take-all).
-    
+
     The leader gets 100% of the weight, everyone else gets 0%.
-    
-    Args:
-        evaluations: Dictionary of miner evaluations
-        hotkeys: List of all miner hotkeys in the metagraph
-    
-    Returns:
-        Dictionary mapping hotkey to weight (0.0 or 1.0)
     """
     leader = select_leader(evaluations)
-    
+
     weights = {}
     for hk in hotkeys:
         if hk in evaluations:
             weights[hk] = 1.0 if hk == leader else 0.0
         else:
             weights[hk] = 0.0
-    
+
     return weights
 
 
@@ -740,45 +732,19 @@ def calculate_weights(
 # ╚════════════════════════════════════════════════════════════════════════════╝
 
 def compute_commitment_hash(data: str, salt: bytes = None) -> str:
-    """
-    Compute commitment hash for commit-reveal scheme.
-    
-    Args:
-        data: Data to commit (e.g., Docker image name)
-        salt: Random salt for hiding commitment
-    
-    Returns:
-        Hex-encoded hash
-    """
+    """Compute commitment hash for commit-reveal scheme."""
     if salt is None:
         salt = os.urandom(32)
-    
+
     content = salt + data.encode()
     return hashlib.sha256(content).hexdigest()
 
 
 def get_reveal_block(current_block: int, blocks_until_reveal: int = CONFIG.blocks_until_reveal) -> int:
-    """
-    Calculate the block at which commitment will be revealed.
-    
-    Args:
-        current_block: Current block number
-        blocks_until_reveal: Number of blocks to wait
-    
-    Returns:
-        Block number for reveal
-    """
+    """Calculate the block at which commitment will be revealed."""
     return current_block + blocks_until_reveal
 
 
 def estimate_reveal_time_minutes(blocks_until_reveal: int = CONFIG.blocks_until_reveal) -> int:
-    """
-    Estimate time until reveal in minutes.
-    
-    Args:
-        blocks_until_reveal: Number of blocks to wait
-    
-    Returns:
-        Estimated minutes until reveal
-    """
+    """Estimate time until reveal in minutes."""
     return (blocks_until_reveal * CONFIG.block_time) // 60

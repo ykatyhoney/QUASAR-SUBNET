@@ -48,6 +48,8 @@ from .inference_verification import (
     calculate_weights,
     generate_random_prompt,
     generate_verification_challenge,
+    run_container_inference,
+    ContainerInferenceResult,
 )
 
 # Export protocol components

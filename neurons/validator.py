@@ -848,24 +848,75 @@ class Validator(BaseValidatorNeuron):
                     "reason": "Reference model failed to capture logits"
                 }
             
-            # For now, without container execution, we can't actually run miner inference
-            # This is a placeholder that would be filled when affinetes/Basilica is available
-            # For testing, we'll use the reference logits (which would always pass)
-            
-            # TODO: When container execution is available:
-            # miner_result = await run_container_inference(hotkey, docker_image, prompt, gen_len, logits_at_step)
-            
-            # For now, we'll mark as "pending" since we can't actually run miner containers
-            # In production, this would compare miner logits against reference
-            
-            print(f"[VALIDATOR]   ⚠️ Container execution not available - marking as pending", flush=True)
-            
+            if not docker_image:
+                print(f"[VALIDATOR]   No docker_image for submission {submission_id} - skipping container verification", flush=True)
+                return {
+                    "verified": None,
+                    "reason": "No docker_image provided - container verification skipped",
+                    "reference_throughput": gen_len / reference_result["elapsed_sec"],
+                    "reference_elapsed_sec": reference_result["elapsed_sec"],
+                    "repo_hash": repo_hash
+                }
+
+            from quasar.inference_verification import run_container_inference as _run_container
+
+            print(f"[VALIDATOR]   Running container inference for {docker_image}...", flush=True)
+            miner_result = _run_container(
+                hotkey=str(submission_id),
+                docker_image=docker_image,
+                prompt=prompt,
+                gen_len=gen_len,
+                logits_at_step=logits_at_step,
+            )
+
+            if not miner_result.success:
+                print(f"[VALIDATOR]   Container execution failed: {miner_result.error}", flush=True)
+                return {
+                    "verified": False,
+                    "reason": f"Container execution failed: {miner_result.error}",
+                    "reference_throughput": gen_len / reference_result["elapsed_sec"],
+                    "reference_elapsed_sec": reference_result["elapsed_sec"],
+                    "repo_hash": repo_hash
+                }
+
+            if miner_result.captured_logits is None:
+                print(f"[VALIDATOR]   Miner container did not return captured_logits", flush=True)
+                return {
+                    "verified": False,
+                    "reason": "Miner container did not return captured_logits",
+                    "repo_hash": repo_hash
+                }
+
+            verification = verify_logits(
+                miner_result.captured_logits,
+                reference_result["captured_logits"]
+            )
+
+            miner_throughput = gen_len / miner_result.elapsed_sec if miner_result.elapsed_sec > 0 else 0
+            ref_throughput = gen_len / reference_result["elapsed_sec"] if reference_result["elapsed_sec"] > 0 else 0
+
+            print(
+                f"[VALIDATOR]   Verification: cosine={verification.cosine_sim:.4f}, "
+                f"max_diff={verification.max_abs_diff:.4f}, "
+                f"verified={verification.verified}",
+                flush=True,
+            )
+            print(
+                f"[VALIDATOR]   Throughput: miner={miner_throughput:.1f} tok/s, "
+                f"reference={ref_throughput:.1f} tok/s",
+                flush=True,
+            )
+
             return {
-                "verified": None,  # None = pending (container execution not available)
-                "reason": "Container execution not available - awaiting affinetes integration",
-                "reference_throughput": gen_len / reference_result["elapsed_sec"],
+                "verified": verification.verified,
+                "reason": verification.reason,
+                "cosine_similarity": verification.cosine_sim,
+                "max_abs_diff": verification.max_abs_diff,
+                "miner_throughput": miner_throughput,
+                "reference_throughput": ref_throughput,
                 "reference_elapsed_sec": reference_result["elapsed_sec"],
-                "repo_hash": repo_hash  # Include repo_hash for consistency checking
+                "miner_elapsed_sec": miner_result.elapsed_sec,
+                "repo_hash": repo_hash
             }
             
         except Exception as e:
