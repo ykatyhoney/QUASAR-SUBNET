@@ -1,9 +1,11 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, PrimaryKeyConstraint, UniqueConstraint
 from sqlalchemy.orm import relationship
 from .database import Base
 from datetime import datetime
 from pydantic import BaseModel
 from typing import List, Optional, Dict
+
+DEFAULT_NETWORK = "finney"
 
 # SQLAlchemy Models
 class Task(Base):

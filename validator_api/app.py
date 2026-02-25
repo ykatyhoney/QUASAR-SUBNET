@@ -121,6 +121,15 @@ def record_success(ip_address: str, db: Session):
         ip_ban.failure_count = 0
         db.commit()
 
+
+def normalize_network(network: Optional[str]) -> str:
+    """Return 'finney' or 'test'. Defaults to 'finney'."""
+    if not network or not str(network).strip():
+        return "finney"
+    n = str(network).strip().lower()
+    return n if n in ("finney", "test") else "finney"
+
+
 # Helper function for solution hash calculation
 def calculate_solution_hash(tokens_per_sec: float, target_sequence_length: int, 
                           benchmarks: Optional[Dict] = None) -> str:
@@ -145,6 +154,18 @@ def calculate_solution_hash(tokens_per_sec: float, target_sequence_length: int,
     # Create hash
     solution_str = json.dumps(solution_data, sort_keys=True)
     return hashlib.sha256(solution_str.encode()).hexdigest()[:16]
+
+
+def _github_username_from_fork_url(fork_url: Optional[str]) -> Optional[str]:
+    """Extract GitHub username from fork URL, e.g. https://github.com/username/repo -> username."""
+    if not fork_url:
+        return None
+    import re
+    m = re.match(r"https?://(?:www\.)?github\.com/([^/]+)", (fork_url or "").strip())
+    return m.group(1) if m else None
+
+
+# REWARD_DISTRIBUTION
 
 # Add new columns if they don't exist (migration)
 from sqlalchemy import text
@@ -499,10 +520,15 @@ class WeightEntry(BaseModel):
     uid: int
     hotkey: str
     weight: float
+    tokens_per_sec: Optional[float] = None
+    github_username: Optional[str] = None
 
 class GetWeightsResponse(BaseModel):
     epoch: int
     weights: List[WeightEntry]
+    round_id: Optional[int] = None
+    round_number: Optional[int] = None
+    round_status: Optional[str] = None
 
 @app.post("/submit_kernel")
 def submit_kernel(
@@ -1368,6 +1394,7 @@ TOP_N_MINERS = 4
 def get_weights(
     round_id: Optional[int] = None,
     network: Optional[str] = None,
+    completed_only: bool = True,
     db: Session = Depends(get_db)
 ):
     """
@@ -1382,9 +1409,9 @@ def get_weights(
     Args:
         round_id: Optional round ID. If not specified, uses the most recent completed round.
         network: "finney" (mainnet) or "test" (testnet). Default finney.
+        completed_only: If True and round_id not specified, only use a completed round (never active). Default True.
     """
     network = normalize_network(network)
-    # If round_id not specified, get most recent completed round for this network; fall back to active round
     if round_id is None:
         round_obj = (
             db.query(models.CompetitionRound)
@@ -1393,7 +1420,7 @@ def get_weights(
             .order_by(models.CompetitionRound.round_number.desc())
             .first()
         )
-        if not round_obj:
+        if not round_obj and not completed_only:
             round_obj = (
                 db.query(models.CompetitionRound)
                 .filter(models.CompetitionRound.network == network)
@@ -1411,7 +1438,7 @@ def get_weights(
     
     if not round_obj:
         print("[WEIGHTS] No round found (completed or active)")
-        return GetWeightsResponse(epoch=int(time.time()), weights=[])
+        return GetWeightsResponse(epoch=int(time.time()), weights=[], round_id=None, round_number=None, round_status=None)
     
     # Get all validated submissions for this round
     submissions = (
@@ -1423,7 +1450,7 @@ def get_weights(
     
     if not submissions:
         print(f"[WEIGHTS] No validated submissions in round {round_obj.round_number}")
-        return GetWeightsResponse(epoch=int(time.time()), weights=[])
+        return GetWeightsResponse(epoch=int(time.time()), weights=[], round_id=round_obj.id, round_number=round_obj.round_number, round_status=round_obj.status)
     
     # Calculate rankings with first-submission-wins logic
     # Note: baseline_submission_id on a round is the baseline for the NEXT round
@@ -1454,7 +1481,7 @@ def get_weights(
     
     if not rankings:
         print(f"[WEIGHTS] No valid rankings for round {round_obj.round_number}")
-        return GetWeightsResponse(epoch=int(time.time()), weights=[])
+        return GetWeightsResponse(epoch=int(time.time()), weights=[], round_id=round_obj.id, round_number=round_obj.round_number, round_status=round_obj.status)
     
     # Distribute weights to top 4
     weights = []
@@ -1470,17 +1497,27 @@ def get_weights(
         ).first()
         uid = miner_reg.uid if miner_reg else 0
         
+        tokens_per_sec = ranking.get("tokens_per_sec")
+        github_username = None
+        sub = db.query(models.SpeedSubmission).filter(
+            models.SpeedSubmission.id == ranking["submission_id"]
+        ).first()
+        if sub and sub.fork_url:
+            github_username = _github_username_from_fork_url(sub.fork_url)
+        
         weights.append(WeightEntry(
             uid=uid,
             hotkey=ranking["miner_hotkey"],
-            weight=weight
+            weight=weight,
+            tokens_per_sec=tokens_per_sec,
+            github_username=github_username
         ))
         
         print(f"  #{ranking['rank']}: {ranking['miner_hotkey'][:12]}... - "
               f"weight={weight:.2%} "
               f"(weighted_score={ranking['weighted_score']:.0f})")
     
-    return GetWeightsResponse(epoch=int(time.time()), weights=weights)
+    return GetWeightsResponse(epoch=int(time.time()), weights=weights, round_id=round_obj.id, round_number=round_obj.round_number, round_status=round_obj.status)
 
 # ==================== ROUND MANAGEMENT ENDPOINTS ====================
 
