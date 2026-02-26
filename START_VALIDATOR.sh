@@ -25,13 +25,14 @@ else
     echo "⚠️  No .env file found. Using defaults."
 fi
 
-# Set defaults if not in .env
+# Set defaults if not in .env (mainnet defaults)
 export VALIDATOR_API_URL=${VALIDATOR_API_URL:-"http://localhost:8000"}
-export NETUID=${NETUID:-383}
-export SUBTENSOR_NETWORK=${SUBTENSOR_NETWORK:-"test"}
+export NETUID=${NETUID:-24}
+export SUBTENSOR_NETWORK=${SUBTENSOR_NETWORK:-"finney"}
 export WALLET_VALIDATOR_NAME=${WALLET_VALIDATOR_NAME:-"quasar_validator"}
 export WALLET_HOTKEY=${WALLET_HOTKEY:-"default"}
 export POLLING_INTERVAL=${POLLING_INTERVAL:-300}
+export SUBTENSOR_CHAIN_ENDPOINT=${SUBTENSOR_CHAIN_ENDPOINT:-""}
 
 # Inference verification settings
 export ENABLE_LOGIT_VERIFICATION=${ENABLE_LOGIT_VERIFICATION:-"true"}
@@ -47,6 +48,9 @@ echo "Configuration:"
 echo "  API URL: $VALIDATOR_API_URL"
 echo "  NetUID: $NETUID"
 echo "  Network: $SUBTENSOR_NETWORK"
+if [ -n "$SUBTENSOR_CHAIN_ENDPOINT" ]; then
+    echo "  Chain Endpoint: $SUBTENSOR_CHAIN_ENDPOINT"
+fi
 echo "  Wallet: $WALLET_VALIDATOR_NAME/$WALLET_HOTKEY"
 echo "  Polling Interval: $POLLING_INTERVAL seconds"
 echo ""
@@ -85,10 +89,17 @@ echo "Starting validator neuron..."
 echo "Press CTRL+C to stop"
 echo ""
 
-python -m neurons.validator \
-    --netuid "$NETUID" \
-    --wallet.name "$WALLET_VALIDATOR_NAME" \
-    --wallet.hotkey "$WALLET_HOTKEY" \
-    --subtensor.network "$SUBTENSOR_NETWORK" \
-    --neuron.polling_interval "$POLLING_INTERVAL" \
+VALIDATOR_ARGS=(
+    --netuid "$NETUID"
+    --wallet.name "$WALLET_VALIDATOR_NAME"
+    --wallet.hotkey "$WALLET_HOTKEY"
+    --subtensor.network "$SUBTENSOR_NETWORK"
+    --neuron.polling_interval "$POLLING_INTERVAL"
     --logging.debug
+)
+
+if [ -n "$SUBTENSOR_CHAIN_ENDPOINT" ]; then
+    VALIDATOR_ARGS+=(--subtensor.chain_endpoint "$SUBTENSOR_CHAIN_ENDPOINT")
+fi
+
+python -m neurons.validator "${VALIDATOR_ARGS[@]}"

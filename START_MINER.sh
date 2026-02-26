@@ -25,15 +25,16 @@ else
     echo "⚠️  No .env file found. Using defaults."
 fi
 
-# Set defaults if not in .env
-export VALIDATOR_API_URL=${VALIDATOR_API_URL:-"http://localhost:8000"}
-export NETUID=${NETUID:-383}
-export SUBTENSOR_NETWORK=${SUBTENSOR_NETWORK:-"test"}
+# Set defaults if not in .env (mainnet defaults)
+export VALIDATOR_API_URL=${VALIDATOR_API_URL:-"https://quasar-validator-api.onrender.com"}
+export NETUID=${NETUID:-24}
+export SUBTENSOR_NETWORK=${SUBTENSOR_NETWORK:-"finney"}
 export WALLET_MINER_NAME=${WALLET_MINER_NAME:-"quasar_miner"}
 export WALLET_HOTKEY=${WALLET_HOTKEY:-"default"}
 export TARGET_SEQUENCE_LENGTH=${TARGET_SEQUENCE_LENGTH:-100000}
 export AGENT_ITERATIONS=${AGENT_ITERATIONS:-100}
 export OPTIMIZATION_INTERVAL=${OPTIMIZATION_INTERVAL:-300}
+export SUBTENSOR_CHAIN_ENDPOINT=${SUBTENSOR_CHAIN_ENDPOINT:-""}
 
 # Model configuration
 export MINER_MODEL_NAME=${MINER_MODEL_NAME:-"Qwen/Qwen3-4B-Instruct-2507"}
@@ -65,6 +66,9 @@ echo "Configuration:"
 echo "  API URL: $VALIDATOR_API_URL"
 echo "  NetUID: $NETUID"
 echo "  Network: $SUBTENSOR_NETWORK"
+if [ -n "$SUBTENSOR_CHAIN_ENDPOINT" ]; then
+    echo "  Chain Endpoint: $SUBTENSOR_CHAIN_ENDPOINT"
+fi
 echo "  Wallet: $WALLET_MINER_NAME/$WALLET_HOTKEY"
 echo "  GitHub User: $GITHUB_USERNAME"
 echo "  Target Seq Length: $TARGET_SEQUENCE_LENGTH"
@@ -134,6 +138,10 @@ if [ -n "$REPO_PATH" ]; then
 fi
 if [ -n "$BYOC_FILE_PATH" ]; then
     MINER_ARGS+=(--byoc-file "$BYOC_FILE_PATH")
+fi
+
+if [ -n "$SUBTENSOR_CHAIN_ENDPOINT" ]; then
+    MINER_ARGS+=(--subtensor.chain_endpoint "$SUBTENSOR_CHAIN_ENDPOINT")
 fi
 
 python -m neurons.miner "${MINER_ARGS[@]}"
