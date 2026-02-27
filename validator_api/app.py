@@ -253,6 +253,9 @@ try:
             if "throughput_verified" not in columns:
                 conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN throughput_verified REAL"))
                 conn.commit()
+            if "validated_tokens_per_sec" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN validated_tokens_per_sec REAL"))
+                conn.commit()
             
             # ═══════════════════════════════════════════════════════════════════════════
             # SCORE COLUMN (for storing validation scores)
@@ -589,6 +592,14 @@ def submit_kernel(
         if req.miner_hotkey != hotkey:
             raise HTTPException(status_code=403, detail="Hotkey mismatch")
 
+        # Logit verification required: only verified submissions can rank
+        
+        if req.tokens_per_sec <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="tokens_per_sec must be a positive number."
+            )
+
         network = normalize_network(getattr(req, "network", None))
 
         # Check if miner is registered for this network, auto-register if not
@@ -703,6 +714,29 @@ def submit_kernel(
                     detail="This coldkey already has a registered hotkey. One hotkey per coldkey."
                 )
 
+        # Rate-limiting
+        # Prevent spam submissions from the same miner (max 1 submission per 5 minutes)
+        SUBMISSION_COOLDOWN_SECONDS = int(os.environ.get("SUBMISSION_COOLDOWN_SECONDS", "300"))  # 5 minutes
+        recent_submission = (
+            db.query(models.SpeedSubmission)
+            .filter(
+                models.SpeedSubmission.miner_hotkey == hotkey,
+                models.SpeedSubmission.network == network,
+                models.SpeedSubmission.created_at >= datetime.utcnow() - timedelta(seconds=SUBMISSION_COOLDOWN_SECONDS)
+            )
+            .order_by(models.SpeedSubmission.created_at.desc())
+            .first()
+        )
+        if recent_submission:
+            seconds_ago = (datetime.utcnow() - recent_submission.created_at).total_seconds()
+            remaining = SUBMISSION_COOLDOWN_SECONDS - seconds_ago
+            print(f"🚫 [SUBMIT_KERNEL] Rate limit: {hotkey[:12]}... submitted {seconds_ago:.0f}s ago (cooldown: {SUBMISSION_COOLDOWN_SECONDS}s)")
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Please wait {remaining:.0f} seconds before submitting again. "
+                       f"Maximum 1 submission per {SUBMISSION_COOLDOWN_SECONDS // 60} minutes."
+            )
+        
         # Calculate solution hash for duplicate detection
         solution_hash = calculate_solution_hash(
             req.tokens_per_sec,
@@ -771,7 +805,7 @@ def submit_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════
-# COMMIT-REVEAL ENDPOINTS (from const's qllm architecture)
+# COMMIT-REVEAL ENDPOINTS (from qllm architecture)
 # Prevents validators from copying miner code before evaluation
 # ═══════════════════════════════════════════════════════════════════════════════════
 
@@ -979,7 +1013,7 @@ def reveal_submission(
                 .first()
             )
             if existing_owner:
-                print(f"🚫 [ANTI-SPAM] GitHub user '{gh_user}' already claimed by hotkey {existing_owner.hotkey[:12]}... — rejecting reveal from {hotkey[:12]}...")
+                print(f"🚫 GitHub user '{gh_user}' already claimed by hotkey {existing_owner.hotkey[:12]}... — rejecting reveal from {hotkey[:12]}...")
                 raise HTTPException(
                     status_code=403,
                     detail=f"GitHub username '{gh_user}' is already registered to a different hotkey. One hotkey per GitHub account."
@@ -1312,11 +1346,54 @@ def mark_validated(
     if score is not None:
         submission.score = float(score)
         print(f"📊 [MARK_VALIDATED] Submission {submission_id}: score={score:.4f}")
+
+    actual_tps = req.get("actual_tokens_per_sec")
+    if actual_tps is not None:
+        actual_tps = float(actual_tps)
+        old_tps = submission.tokens_per_sec
+        submission.validated_tokens_per_sec = actual_tps
     
+        if old_tps and actual_tps > 0:
+            discrepancy_pct = abs(old_tps - actual_tps) / max(old_tps, 1) * 100
+            discrepancy_abs = abs(old_tps - actual_tps)
+            
+            # Server-side thresholds (miners cannot bypass)
+            DISCREPANCY_PCT_THRESHOLD = float(os.environ.get("DISCREPANCY_PCT_THRESHOLD", "50.0"))  # 50% difference
+            DISCREPANCY_ABS_THRESHOLD = float(os.environ.get("DISCREPANCY_ABS_THRESHOLD", "1000.0"))  # 1000 tok/s minimum
+            
+            should_flag = (
+                discrepancy_pct > DISCREPANCY_PCT_THRESHOLD and 
+                discrepancy_abs > DISCREPANCY_ABS_THRESHOLD
+            )
+            
+            if should_flag:
+                print(f"🚨 [MARK_VALIDATED] TPS MISMATCH for {submission.miner_hotkey[:12]}...: "
+                      f"claimed={old_tps:.2f}, actual={actual_tps:.2f} "
+                      f"(diff: {discrepancy_pct:.1f}%, abs: {discrepancy_abs:.0f} tok/s)")
+                
+                # Auto-flag miner for spam (claiming unrealistic values)
+                miner_reg = db.query(models.MinerRegistration).filter(
+                    models.MinerRegistration.hotkey == submission.miner_hotkey,
+                    models.MinerRegistration.network == (getattr(submission, "network", None) or DEFAULT_NETWORK)
+                ).first()
+                
+                if miner_reg and not miner_reg.is_flagged:
+                    miner_reg.is_flagged = True
+                    miner_reg.flag_reason = (
+                        f"Large TPS discrepancy: claimed {old_tps:.0f} tok/s, "
+                        f"actual {actual_tps:.0f} tok/s (diff: {discrepancy_pct:.1f}%, abs: {discrepancy_abs:.0f} tok/s)"
+                    )
+                    db.commit()
+                    print(f"🚫 [MARK_VALIDATED] Auto-flagged miner {submission.miner_hotkey[:12]}... for spam")
+            else:
+                print(f"📊 [MARK_VALIDATED] Submission {submission_id}: validated_tps={actual_tps:.2f} "
+                      f"(claimed={old_tps:.2f}, diff={discrepancy_pct:.1f}%, abs={discrepancy_abs:.0f} tok/s)")
+        else:
+            print(f"📊 [MARK_VALIDATED] Submission {submission_id}: validated_tps={actual_tps:.2f}")
+
     db.commit()
     
     # ═══════════════════════════════════════════════════════════════════════════
-    # UPDATE MINER_SCORES TABLE
     # Aggregate scores per miner per league
     # ═══════════════════════════════════════════════════════════════════════════
     if score is not None and submission.miner_hotkey:
@@ -1979,42 +2056,57 @@ def calculate_rankings(
             print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Not revealed yet")
             continue
         
-        # Skip submissions that FAILED logit verification
-        # Note: None means not verified yet, which is allowed for backward compatibility
-        # In strict mode, you could also skip None (pending verification)
-        if sub.logit_verification_passed == False:
-            print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Failed logit verification")
+        # ── ANTI-SPAM: Only rank submissions that have passed logit verification ──
+        # Require explicit True (not None/pending) to prevent unvalidated spam from ranking.
+        if sub.logit_verification_passed != True:
+            if sub.logit_verification_passed == False:
+                print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Failed logit verification")
+            else:
+                print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Logit verification pending (not validated yet)")
             continue
         
+        # ── ANTI-SPAM: Only use validator-measured TPS ──
+        # Never fall back to miner-claimed value. This prevents spam submissions
+        # from ranking high before validation. Unvalidated submissions are excluded above.
+        if sub.validated_tokens_per_sec is None:
+            print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: No validated_tokens_per_sec (not yet validated)")
+            continue
+        
+        effective_tps = sub.validated_tokens_per_sec
+
         # Skip if below baseline (for round 2+)
+        # Baseline must also be validated (no fallback to claimed)
         if baseline:
+            if baseline.validated_tokens_per_sec is None:
+                # Baseline not validated yet, skip comparison
+                continue
+            baseline_tps = baseline.validated_tokens_per_sec
             baseline_league = get_league_for_seq_len(baseline.target_sequence_length)
             baseline_multiplier = LEAGUE_MULTIPLIERS.get(baseline_league, 1.0)
-            baseline_weighted = baseline.tokens_per_sec * baseline_multiplier
-            
+            baseline_weighted = baseline_tps * baseline_multiplier
+
             sub_league = get_league_for_seq_len(sub.target_sequence_length)
             sub_multiplier = LEAGUE_MULTIPLIERS.get(sub_league, 1.0)
-            sub_weighted = sub.tokens_per_sec * sub_multiplier
-            
+            sub_weighted = effective_tps * sub_multiplier
+
             if sub_weighted <= baseline_weighted:
-                continue  # Skip submissions that don't beat baseline
-        
-        # Calculate weighted score
+                continue
+
         league = get_league_for_seq_len(sub.target_sequence_length)
         multiplier = LEAGUE_MULTIPLIERS.get(league, 1.0)
-        weighted_score = sub.tokens_per_sec * multiplier
-        
+        weighted_score = effective_tps * multiplier
+
         ranked_submissions.append({
             "submission_id": sub.id,
             "miner_hotkey": sub.miner_hotkey,
-            "tokens_per_sec": sub.tokens_per_sec,
+            "tokens_per_sec": effective_tps,
             "target_sequence_length": sub.target_sequence_length,
             "league": league,
             "multiplier": multiplier,
             "weighted_score": weighted_score,
             "created_at": sub.created_at,
             "solution_hash": sub.solution_hash,
-            # Verification info (from const's qllm architecture)
+            # Verification info (from qllm architecture)
             "logit_verification_passed": sub.logit_verification_passed,
             "cosine_similarity": sub.cosine_similarity,
             "max_abs_diff": sub.max_abs_diff,

@@ -1044,18 +1044,23 @@ class Validator(BaseValidatorNeuron):
                         evaluated_scores[miner_hotkey] = normalized_score
                     
                     # Mark submission as validated in API and record score
+                    # Send the validator-measured actual_tokens_per_sec so rankings
+                    # use the real value, not the miner-claimed one.
+                    actual_tps = result.get("actual_performance", 0.0)
                     if submission_id:
                         try:
+                            mark_payload = {
+                                "submission_id": submission_id,
+                                "score": normalized_score,
+                                "actual_tokens_per_sec": actual_tps,
+                            }
                             response = requests.post(
                                 f"{VALIDATOR_API_URL}/mark_validated",
-                                json={
-                                    "submission_id": submission_id,
-                                    "score": normalized_score  # Include the normalized score
-                                },
+                                json=mark_payload,
                                 timeout=30
                             )
                             if response.status_code == 200:
-                                print(f"[VALIDATOR] ✅ Submission {submission_id} marked as validated with score {normalized_score:.4f}", flush=True)
+                                print(f"[VALIDATOR] ✅ Submission {submission_id} marked validated: score={normalized_score:.4f}, actual_tps={actual_tps:.2f}", flush=True)
                             else:
                                 print(f"[VALIDATOR] ⚠️ Failed to mark submission as validated: {response.status_code} - {response.text}", flush=True)
                         except Exception as e:

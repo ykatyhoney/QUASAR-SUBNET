@@ -132,7 +132,7 @@ class SpeedSubmission(Base):
     docker_image = Column(String, nullable=True)  # Docker image for inference (optional, for container-based miners)
     
     # ═══════════════════════════════════════════════════════════════════════════
-    # LOGIT VERIFICATION FIELDS (from const's qllm architecture)
+    # LOGIT VERIFICATION FIELDS (from qllm architecture)
     # Verifies miners are running the actual model, not returning bogus values
     # ═══════════════════════════════════════════════════════════════════════════
     logit_verification_passed = Column(Boolean, nullable=True)  # Whether miner passed logit verification
@@ -140,7 +140,8 @@ class SpeedSubmission(Base):
     max_abs_diff = Column(Float, nullable=True)  # Maximum absolute difference in logits
     verification_reason = Column(String, nullable=True)  # Reason for verification failure (if any)
     throughput_verified = Column(Float, nullable=True)  # Verified throughput (tok/sec) from logit check
-    
+    validated_tokens_per_sec = Column(Float, nullable=True)  # Validator-measured TPS
+
     # Relationships
     round = relationship("CompetitionRound", back_populates="submissions", foreign_keys=[round_id])
 
