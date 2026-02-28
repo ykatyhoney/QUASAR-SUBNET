@@ -24,6 +24,10 @@ if parent_dir not in sys.path:
 
 import quasar
 from quasar.base.validator import BaseValidatorNeuron
+from quasar.base.utils.weight_utils import (
+    process_weights_for_netuid,
+    convert_weights_and_uids_for_emit,
+)
 from quasar.utils.context_builder import (
     build_full_context,
     validate_repo_structure,
@@ -1142,6 +1146,130 @@ class Validator(BaseValidatorNeuron):
     def should_set_weights(self) -> bool:
         """Override base class: we handle set_weights() in forward(), not in sync()."""
         return False
+    
+    def set_weights(self):
+        """
+        Override set_weights to return success status for proper error handling.
+        Returns True if weights were successfully set on-chain, False otherwise.
+        """
+        # Convert to numpy if it's a torch tensor
+        scores = self.scores
+        if isinstance(scores, torch.Tensor):
+            scores = scores.detach().cpu().numpy()
+
+        # Check if scores contains any NaN values and log a warning if it does.
+        if np.isnan(scores).any():
+            bt.logging.warning(
+                f"Scores contain NaN values. This may be due to a lack of responses from miners, or a bug in your reward functions."
+            )
+
+        # Calculate the average reward for each uid across non-zero values.
+        # Replace any NaN values with 0.
+        # Compute the norm of the scores
+        norm = np.linalg.norm(scores, ord=1, axis=0, keepdims=True)
+
+        # Check if the norm is zero or contains NaN values
+        if np.any(norm == 0) or np.isnan(norm).any():
+            norm = np.ones_like(norm)  # Avoid division by zero or NaN
+
+        # Compute raw_weights safely
+        raw_weights = scores / norm
+
+        bt.logging.debug("raw_weights", raw_weights)
+        bt.logging.debug("raw_weight_uids", str(self.metagraph.uids.tolist()))
+        # Process the raw weights to final_weights via subtensor limitations.
+        (
+            processed_weight_uids,
+            processed_weights,
+        ) = process_weights_for_netuid(
+            uids=self.metagraph.uids,
+            weights=raw_weights,
+            netuid=self.config.netuid,
+            subtensor=self.subtensor,
+            metagraph=self.metagraph,
+        )
+        bt.logging.debug("processed_weights", processed_weights)
+        bt.logging.debug("processed_weight_uids", processed_weight_uids)
+
+        # Convert to uint16 weights and uids.
+        (
+            uint_uids,
+            uint_weights,
+        ) = convert_weights_and_uids_for_emit(
+            uids=processed_weight_uids, weights=processed_weights
+        )
+        bt.logging.debug("uint_weights", uint_weights)
+        bt.logging.debug("uint_uids", uint_uids)
+
+        # Diagnostic checks before setting weights
+        try:
+            # Check if validator is registered
+            validator_uid = None
+            for uid in range(self.metagraph.n):
+                if self.metagraph.hotkeys[uid] == self.wallet.hotkey.ss58_address:
+                    validator_uid = uid
+                    break
+            
+            if validator_uid is None:
+                error_msg = "Validator hotkey not found in metagraph - validator may not be registered on subnet"
+                print(f"[VALIDATOR] ❌ {error_msg}", flush=True)
+                bt.logging.error(error_msg)
+                return False
+            
+            # Check if validator has permit (can set weights)
+            if not self.metagraph.validator_permit[validator_uid]:
+                error_msg = f"Validator UID {validator_uid} does not have validator_permit - cannot set weights"
+                print(f"[VALIDATOR] ❌ {error_msg}", flush=True)
+                bt.logging.error(error_msg)
+                return False
+            
+            # Check if we have UIDs to set weights for
+            if len(uint_uids) == 0 or len(uint_weights) == 0:
+                error_msg = "No UIDs or weights to set (all weights are zero)"
+                print(f"[VALIDATOR] ⚠️ {error_msg}", flush=True)
+                bt.logging.warning(error_msg)
+                return False
+            
+            print(f"[VALIDATOR] 🔍 Attempting to set weights for {len(uint_uids)} miners...", flush=True)
+            bt.logging.info(f"Setting weights for {len(uint_uids)} miners: UIDs={uint_uids[:5]}... (showing first 5)")
+            
+        except Exception as diag_error:
+            print(f"[VALIDATOR] ⚠️ Diagnostic check failed: {diag_error}", flush=True)
+            bt.logging.warning(f"Diagnostic check failed: {diag_error}")
+        
+        # Set the weights on chain via our subtensor connection.
+        result, msg = self.subtensor.set_weights(
+            wallet=self.wallet,
+            netuid=self.config.netuid,
+            uids=uint_uids,
+            weights=uint_weights,
+            wait_for_finalization=False,
+            wait_for_inclusion=False,
+            version_key=self.spec_version,
+        )
+        if result is True:
+            print(f"[VALIDATOR] ✅ set_weights on chain successfully!", flush=True)
+            bt.logging.info("set_weights on chain successfully!")
+            return True
+        else:
+            # Print detailed error message
+            error_msg = f"set_weights failed: {msg}"
+            print(f"[VALIDATOR] ❌ {error_msg}", flush=True)
+            bt.logging.error(error_msg)
+            
+            # Provide helpful diagnostics based on common error messages
+            if msg and isinstance(msg, str):
+                msg_lower = msg.lower()
+                if "cooldown" in msg_lower or "too soon" in msg_lower:
+                    print(f"[VALIDATOR] 💡 This is a cooldown issue - will retry in next cycle", flush=True)
+                elif "stake" in msg_lower or "balance" in msg_lower:
+                    print(f"[VALIDATOR] 💡 Check validator stake/balance - may need more TAO", flush=True)
+                elif "not registered" in msg_lower or "not found" in msg_lower:
+                    print(f"[VALIDATOR] 💡 Validator may not be registered on subnet {self.config.netuid}", flush=True)
+                elif "permit" in msg_lower:
+                    print(f"[VALIDATOR] 💡 Validator may not have validator_permit", flush=True)
+            
+            return False
 
     def save_state(self):
         """Save validator state to disk (numpy format, compatible with base class)."""
@@ -1299,8 +1427,14 @@ class Validator(BaseValidatorNeuron):
                             print(f"[VALIDATOR] 📊 Updated self.scores for {resolved_count} miners from API weights", flush=True)
                             bt.logging.info(f"Updated scores for {resolved_count} miners, calling set_weights()")
                             self.save_state()
-                            self.set_weights()
-                            bt.logging.success(f"✅ Weights submitted to Bittensor chain")
+                            success = self.set_weights()
+                            if success:
+                                print(f"[VALIDATOR] ✅ Weights successfully set on Bittensor chain", flush=True)
+                                bt.logging.success(f"✅ Weights submitted to Bittensor chain")
+                            else:
+                                # Error message already printed in set_weights() method
+                                print(f"[VALIDATOR] ⚠️ Weight setting failed - will retry in next cycle", flush=True)
+                                bt.logging.warning(f"⚠️ Weight setting failed - will retry in next cycle")
                         else:
                             print(f"[VALIDATOR] ⚠️ No miners from API weights found in metagraph", flush=True)
                     else:
