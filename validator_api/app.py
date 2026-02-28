@@ -562,6 +562,7 @@ class GetWeightsResponse(BaseModel):
     round_id: Optional[int] = None
     round_number: Optional[int] = None
     round_status: Optional[str] = None
+    winner_hotkey: Optional[str] = None
 
 @app.post("/submit_kernel")
 def submit_kernel(
@@ -1721,7 +1722,7 @@ def get_weights(
     
     if not round_obj:
         print("[WEIGHTS] No round found (completed or active)")
-        return GetWeightsResponse(epoch=int(time.time()), weights=[], round_id=None, round_number=None, round_status=None)
+        return GetWeightsResponse(epoch=int(time.time()), weights=[], round_id=None, round_number=None, round_status=None, winner_hotkey=None)
     
     # Get all validated submissions for this round
     submissions = (
@@ -1733,7 +1734,7 @@ def get_weights(
     
     if not submissions:
         print(f"[WEIGHTS] No validated submissions in round {round_obj.round_number}")
-        return GetWeightsResponse(epoch=int(time.time()), weights=[], round_id=round_obj.id, round_number=round_obj.round_number, round_status=round_obj.status)
+        return GetWeightsResponse(epoch=int(time.time()), weights=[], round_id=round_obj.id, round_number=round_obj.round_number, round_status=round_obj.status, winner_hotkey=round_obj.winner_hotkey)
     
     # Calculate rankings with first-submission-wins logic
     # Note: baseline_submission_id on a round is the baseline for the NEXT round
@@ -1764,7 +1765,7 @@ def get_weights(
     
     if not rankings:
         print(f"[WEIGHTS] No valid rankings for round {round_obj.round_number}")
-        return GetWeightsResponse(epoch=int(time.time()), weights=[], round_id=round_obj.id, round_number=round_obj.round_number, round_status=round_obj.status)
+        return GetWeightsResponse(epoch=int(time.time()), weights=[], round_id=round_obj.id, round_number=round_obj.round_number, round_status=round_obj.status, winner_hotkey=round_obj.winner_hotkey)
     
     # Distribute weights to top 4
     weights = []
@@ -1800,7 +1801,14 @@ def get_weights(
               f"weight={weight:.2%} "
               f"(weighted_score={ranking['weighted_score']:.0f})")
     
-    return GetWeightsResponse(epoch=int(time.time()), weights=weights, round_id=round_obj.id, round_number=round_obj.round_number, round_status=round_obj.status)
+    return GetWeightsResponse(
+        epoch=int(time.time()), 
+        weights=weights, 
+        round_id=round_obj.id, 
+        round_number=round_obj.round_number, 
+        round_status=round_obj.status,
+        winner_hotkey=round_obj.winner_hotkey
+    )
 
 # ==================== ROUND MANAGEMENT ENDPOINTS ====================
 
@@ -1831,6 +1839,14 @@ def _finalize_round_impl(round_obj, db):
         if winner_submission:
             winner_submission.is_baseline = True
             db.commit()
+        print(f"✅ [FINALIZE] Round {round_obj.round_number} winner: {round_obj.winner_hotkey}")
+    else:
+        print(f"⚠️ [FINALIZE] Round {round_obj.round_number} has no valid rankings (no submissions passed all filters)")
+        print(f"   Validated submissions: {len(submissions)}")
+        print(f"   Possible reasons:")
+        print(f"   - No submissions passed logit verification")
+        print(f"   - No submissions have validated_tokens_per_sec")
+        print(f"   - All submissions below baseline")
     round_obj.status = "completed"
     db.commit()
 
@@ -2047,7 +2063,7 @@ def calculate_rankings(
     ranked_submissions = []
     for sub in submissions:
         # ═══════════════════════════════════════════════════════════════════════
-        # LOGIT VERIFICATION FILTER (from const's qllm architecture)
+        # LOGIT VERIFICATION FILTER (from qllm architecture)
         # Skip submissions that failed logit verification or are not revealed
         # ═══════════════════════════════════════════════════════════════════════
         
@@ -2056,7 +2072,7 @@ def calculate_rankings(
             print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Not revealed yet")
             continue
         
-        # ── ANTI-SPAM: Only rank submissions that have passed logit verification ──
+        # Only rank submissions that have passed logit verification ──
         # Require explicit True (not None/pending) to prevent unvalidated spam from ranking.
         if sub.logit_verification_passed != True:
             if sub.logit_verification_passed == False:
@@ -2230,5 +2246,291 @@ def finalize_round(round_id: int, db: Session = Depends(get_db)):
         "status": "completed",
         "round_id": round_id,
         "winner": round_obj.winner_hotkey,
+        "rankings": rankings[:4]  # Top 4
+    }
+
+@app.get("/get_completed_rounds")
+def get_completed_rounds(
+    network: Optional[str] = None,
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    """
+    Get list of completed rounds with their winners.
+    Useful for viewing round history and checking if winners were set.
+    """
+    network = normalize_network(network)
+    
+    rounds = (
+        db.query(models.CompetitionRound)
+        .filter(models.CompetitionRound.network == network)
+        .filter(models.CompetitionRound.status == "completed")
+        .order_by(models.CompetitionRound.round_number.desc())
+        .limit(limit)
+        .all()
+    )
+    
+    result = []
+    for round_obj in rounds:
+        # Count submissions
+        submission_count = (
+            db.query(models.SpeedSubmission)
+            .filter(models.SpeedSubmission.round_id == round_obj.id)
+            .count()
+        )
+        
+        validated_count = (
+            db.query(models.SpeedSubmission)
+            .filter(models.SpeedSubmission.round_id == round_obj.id)
+            .filter(models.SpeedSubmission.validated == True)
+            .count()
+        )
+        
+        result.append({
+            "round_id": round_obj.id,
+            "round_number": round_obj.round_number,
+            "start_time": round_obj.start_time.isoformat() if isinstance(round_obj.start_time, datetime) else str(round_obj.start_time),
+            "end_time": round_obj.end_time.isoformat() if isinstance(round_obj.end_time, datetime) else str(round_obj.end_time),
+            "status": round_obj.status,
+            "winner_hotkey": round_obj.winner_hotkey,
+            "baseline_submission_id": round_obj.baseline_submission_id,
+            "total_submissions": submission_count,
+            "validated_submissions": validated_count,
+            "has_winner": round_obj.winner_hotkey is not None
+        })
+    
+    return {
+        "network": network,
+        "completed_rounds": result,
+        "total": len(result)
+    }
+
+@app.post("/refinalize_round/{round_id}")
+def refinalize_round(round_id: int, db: Session = Depends(get_db)):
+    """
+    Re-finalize a completed round that doesn't have a winner_hotkey set.
+    Useful if a round was completed but winner wasn't set due to timing issues.
+    """
+    round_obj = db.query(models.CompetitionRound).filter(
+        models.CompetitionRound.id == round_id
+    ).first()
+    
+    if not round_obj:
+        raise HTTPException(status_code=404, detail="Round not found")
+    
+    if round_obj.status != "completed":
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Round is not completed (status: {round_obj.status}). Only completed rounds can be re-finalized."
+        )
+    
+    if round_obj.winner_hotkey:
+        return {
+            "status": "already_has_winner",
+            "round_id": round_id,
+            "winner_hotkey": round_obj.winner_hotkey,
+            "message": "Round already has a winner. No need to re-finalize."
+        }
+    
+    # Get all validated submissions for this round
+    submissions = (
+        db.query(models.SpeedSubmission)
+        .filter(models.SpeedSubmission.round_id == round_id)
+        .filter(models.SpeedSubmission.validated == True)
+        .all()
+    )
+    
+    if not submissions:
+        return {
+            "status": "no_submissions",
+            "round_id": round_id,
+            "message": "No validated submissions found in this round."
+        }
+    
+    # Calculate rankings
+    rankings = calculate_rankings(submissions, round_obj.baseline_submission_id, db)
+    
+    if not rankings:
+        # Check why rankings are empty
+        total_submissions = len(submissions)
+        revealed_count = sum(1 for s in submissions if s.is_revealed == True)
+        verified_count = sum(1 for s in submissions if s.logit_verification_passed == True)
+        validated_tps_count = sum(1 for s in submissions if s.validated_tokens_per_sec is not None)
+        
+        return {
+            "status": "no_valid_rankings",
+            "round_id": round_id,
+            "message": "No submissions passed all ranking filters.",
+            "diagnostics": {
+                "total_validated_submissions": total_submissions,
+                "revealed_submissions": revealed_count,
+                "passed_logit_verification": verified_count,
+                "have_validated_tokens_per_sec": validated_tps_count
+            }
+        }
+    
+    # Set winner
+    winner = rankings[0]
+    round_obj.winner_hotkey = winner["miner_hotkey"]
+    round_obj.baseline_submission_id = winner["submission_id"]
+    db.commit()
+    
+    # Mark winning submission as baseline for next round
+    winner_submission = db.query(models.SpeedSubmission).filter(
+        models.SpeedSubmission.id == winner["submission_id"]
+    ).first()
+    if winner_submission:
+        winner_submission.is_baseline = True
+        db.commit()
+    
+    print(f"✅ [REFINALIZE] Round {round_id} winner set: {round_obj.winner_hotkey}")
+    
+    return {
+        "status": "success",
+        "round_id": round_id,
+        "winner_hotkey": round_obj.winner_hotkey,
+        "rankings": rankings[:4]  # Top 4
+    }
+
+@app.get("/get_completed_rounds")
+def get_completed_rounds(
+    network: Optional[str] = None,
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    """
+    Get list of completed rounds with their winners.
+    Useful for viewing round history and checking if winners were set.
+    """
+    network = normalize_network(network)
+    
+    rounds = (
+        db.query(models.CompetitionRound)
+        .filter(models.CompetitionRound.network == network)
+        .filter(models.CompetitionRound.status == "completed")
+        .order_by(models.CompetitionRound.round_number.desc())
+        .limit(limit)
+        .all()
+    )
+    
+    result = []
+    for round_obj in rounds:
+        # Count submissions
+        submission_count = (
+            db.query(models.SpeedSubmission)
+            .filter(models.SpeedSubmission.round_id == round_obj.id)
+            .count()
+        )
+        
+        validated_count = (
+            db.query(models.SpeedSubmission)
+            .filter(models.SpeedSubmission.round_id == round_obj.id)
+            .filter(models.SpeedSubmission.validated == True)
+            .count()
+        )
+        
+        result.append({
+            "round_id": round_obj.id,
+            "round_number": round_obj.round_number,
+            "start_time": round_obj.start_time.isoformat() if isinstance(round_obj.start_time, datetime) else str(round_obj.start_time),
+            "end_time": round_obj.end_time.isoformat() if isinstance(round_obj.end_time, datetime) else str(round_obj.end_time),
+            "status": round_obj.status,
+            "winner_hotkey": round_obj.winner_hotkey,
+            "baseline_submission_id": round_obj.baseline_submission_id,
+            "total_submissions": submission_count,
+            "validated_submissions": validated_count,
+            "has_winner": round_obj.winner_hotkey is not None
+        })
+    
+    return {
+        "network": network,
+        "completed_rounds": result,
+        "total": len(result)
+    }
+
+@app.post("/refinalize_round/{round_id}")
+def refinalize_round(round_id: int, db: Session = Depends(get_db)):
+    """
+    Re-finalize a completed round that doesn't have a winner_hotkey set.
+    Useful if a round was completed but winner wasn't set due to timing issues.
+    """
+    round_obj = db.query(models.CompetitionRound).filter(
+        models.CompetitionRound.id == round_id
+    ).first()
+    
+    if not round_obj:
+        raise HTTPException(status_code=404, detail="Round not found")
+    
+    if round_obj.status != "completed":
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Round is not completed (status: {round_obj.status}). Only completed rounds can be re-finalized."
+        )
+    
+    if round_obj.winner_hotkey:
+        return {
+            "status": "already_has_winner",
+            "round_id": round_id,
+            "winner_hotkey": round_obj.winner_hotkey,
+            "message": "Round already has a winner. No need to re-finalize."
+        }
+    
+    # Get all validated submissions for this round
+    submissions = (
+        db.query(models.SpeedSubmission)
+        .filter(models.SpeedSubmission.round_id == round_id)
+        .filter(models.SpeedSubmission.validated == True)
+        .all()
+    )
+    
+    if not submissions:
+        return {
+            "status": "no_submissions",
+            "round_id": round_id,
+            "message": "No validated submissions found in this round."
+        }
+    
+    # Calculate rankings
+    rankings = calculate_rankings(submissions, round_obj.baseline_submission_id, db)
+    
+    if not rankings:
+        # Check why rankings are empty
+        total_submissions = len(submissions)
+        revealed_count = sum(1 for s in submissions if s.is_revealed == True)
+        verified_count = sum(1 for s in submissions if s.logit_verification_passed == True)
+        validated_tps_count = sum(1 for s in submissions if s.validated_tokens_per_sec is not None)
+        
+        return {
+            "status": "no_valid_rankings",
+            "round_id": round_id,
+            "message": "No submissions passed all ranking filters.",
+            "diagnostics": {
+                "total_validated_submissions": total_submissions,
+                "revealed_submissions": revealed_count,
+                "passed_logit_verification": verified_count,
+                "have_validated_tokens_per_sec": validated_tps_count
+            }
+        }
+    
+    # Set winner
+    winner = rankings[0]
+    round_obj.winner_hotkey = winner["miner_hotkey"]
+    round_obj.baseline_submission_id = winner["submission_id"]
+    db.commit()
+    
+    # Mark winning submission as baseline for next round
+    winner_submission = db.query(models.SpeedSubmission).filter(
+        models.SpeedSubmission.id == winner["submission_id"]
+    ).first()
+    if winner_submission:
+        winner_submission.is_baseline = True
+        db.commit()
+    
+    print(f"✅ [REFINALIZE] Round {round_id} winner set: {round_obj.winner_hotkey}")
+    
+    return {
+        "status": "success",
+        "round_id": round_id,
+        "winner_hotkey": round_obj.winner_hotkey,
         "rankings": rankings[:4]  # Top 4
     }
