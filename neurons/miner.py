@@ -121,7 +121,7 @@ class Miner(BaseMinerNeuron):
         self.fork_name = os.getenv("GITHUB_FORK_NAME", "")
         
         # Validator API URL
-        self.validator_api_url = os.getenv("VALIDATOR_API_URL", "https://quasar-subnet.onrender.com")
+        self.validator_api_url = os.getenv("VALIDATOR_API_URL", "https://quasar-validator-api.onrender.com")
         
         # Agent configuration
         self.agent_iterations = int(os.getenv("AGENT_ITERATIONS", "100"))

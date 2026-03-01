@@ -146,7 +146,7 @@ def add_args(cls, parser):
         "--api_root",
         type=str,
         help="The root URL for the Validator API.",
-        default="https://quasar-subnet.onrender.com",
+        default="https://quasar-validator-api.onrender.com",
     )
 
     parser.add_argument(

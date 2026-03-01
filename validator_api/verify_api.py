@@ -6,7 +6,7 @@ import hashlib
 
 import sys
 
-API_URL = "https://quasar-subnet.onrender.com"
+API_URL = "https://quasar-validator-api.onrender.com"
 if len(sys.argv) > 1:
     API_URL = sys.argv[1]
 
