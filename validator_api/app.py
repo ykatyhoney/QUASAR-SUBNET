@@ -1578,24 +1578,39 @@ def sync_uids(
     if not isinstance(uid_map, dict):
         raise HTTPException(status_code=400, detail="uid_map required (dict of hotkey -> uid)")
     coldkey_map = req.get("coldkey_map") or {}
-    updated = 0
-    for hotkey, uid in uid_map.items():
-        registration = db.query(models.MinerRegistration).filter(
-            models.MinerRegistration.hotkey == hotkey,
+
+    if not uid_map:
+        return {"status": "ok", "updated": 0, "total_entries": 0, "network": network}
+    
+    # OPTIMIZATION: Bulk fetch all existing registrations in one query instead of N queries
+    hotkeys_list = list(uid_map.keys())
+    existing_regs = {
+        reg.hotkey: reg
+        for reg in db.query(models.MinerRegistration).filter(
+            models.MinerRegistration.hotkey.in_(hotkeys_list),
             models.MinerRegistration.network == network
-        ).first()
+        ).all()
+    }
+    
+    updated = 0
+    new_regs = []
+    
+    for hotkey, uid in uid_map.items():
+        registration = existing_regs.get(hotkey)
         if registration:
             changed = False
             if registration.uid != uid:
                 old_uid = registration.uid
                 registration.uid = uid
                 changed = True
-                print(f"[SYNC_UIDS] Updated {hotkey[:12]}... on {network}: UID {old_uid} -> {uid}")
+                if updated < 5:
+                    print(f"[SYNC_UIDS] Updated {hotkey[:12]}... on {network}: UID {old_uid} -> {uid}")
             ck = coldkey_map.get(hotkey)
             if ck and registration.coldkey != ck:
                 registration.coldkey = ck
                 changed = True
-                print(f"[SYNC_UIDS] Updated coldkey for {hotkey[:12]}... on {network}")
+                if updated < 5:
+                    print(f"[SYNC_UIDS] Updated coldkey for {hotkey[:12]}... on {network}")
             if changed:
                 updated += 1
         else:
@@ -1603,12 +1618,16 @@ def sync_uids(
                 hotkey=hotkey, network=network, uid=uid,
                 coldkey=coldkey_map.get(hotkey)
             )
-            db.add(new_reg)
+            new_regs.append(new_reg)
             updated += 1
-            print(f"[SYNC_UIDS] Created registration for {hotkey[:12]}... on {network} with UID={uid}")
+            if len(new_regs) <= 5:
+                print(f"[SYNC_UIDS] Created registration for {hotkey[:12]}... on {network} with UID={uid}")
+    
+    if new_regs:
+        db.bulk_save_objects(new_regs)
     
     db.commit()
-    print(f"[SYNC_UIDS] Synced {updated} UIDs for network={network}")
+    print(f"[SYNC_UIDS] Synced {updated} UIDs for network={network} ({len(new_regs)} new, {updated - len(new_regs)} updated)")
     return {"status": "ok", "updated": updated, "total_entries": len(uid_map), "network": network}
 
 

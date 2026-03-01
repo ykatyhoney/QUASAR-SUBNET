@@ -1329,6 +1329,8 @@ class Validator(BaseValidatorNeuron):
                 bt.logging.warning(f"Failed to get submission rate: {e}")
             
             # Sync metagraph UIDs to the API so weights are set to correct UIDs
+            # NOTE: UID sync is non-critical - if it fails, validator continues normally
+            # Weights can still be set using hotkeys from the API response
             try:
                 self.metagraph.sync(subtensor=self.subtensor)
                 uid_map = {}
@@ -1338,19 +1340,24 @@ class Validator(BaseValidatorNeuron):
                 if uid_map:
                     net = getattr(self.subtensor, "network", None) or "finney"
                     network = "test" if str(net).lower() == "test" else "finney"
+                    # Increased timeout
                     sync_resp = requests.post(
                         f"{VALIDATOR_API_URL}/sync_uids",
                         json={"network": network, "uid_map": uid_map},
-                        timeout=15
+                        timeout=(5, 30)  # 5s connect, 30s read timeout
                     )
                     if sync_resp.status_code == 200:
                         sync_data = sync_resp.json()
                         if sync_data.get("updated", 0) > 0:
                             print(f"[VALIDATOR] 🔄 Synced {sync_data['updated']} UIDs to API", flush=True)
                     else:
-                        print(f"[VALIDATOR] ⚠️ UID sync failed (status {sync_resp.status_code})", flush=True)
+                        print(f"[VALIDATOR] ⚠️ UID sync failed (status {sync_resp.status_code}) - non-critical", flush=True)
+            except requests.exceptions.Timeout as e:
+                print(f"[VALIDATOR] ⚠️ UID sync timed out (non-critical, continuing): {e}", flush=True)
+                bt.logging.warning(f"UID sync timed out (non-critical): {e}")
             except Exception as e:
-                print(f"[VALIDATOR] ⚠️ UID sync failed: {e}", flush=True)
+                print(f"[VALIDATOR] ⚠️ UID sync failed (non-critical, continuing): {e}", flush=True)
+                bt.logging.warning(f"UID sync failed (non-critical): {e}")
 
             # Evaluate performance submissions
             print("[VALIDATOR] ⚡ Evaluating performance submissions...", flush=True)
