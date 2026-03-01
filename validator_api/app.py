@@ -55,7 +55,7 @@ def get_client_ip(request: Request) -> Optional[str]:
     Extract the real client IP from a request, correctly handling reverse proxies.
     Priority: X-Forwarded-For (first entry) > X-Real-IP > request.client.host.
     Behind reverse proxies (e.g. Render, Cloudflare), request.client.host is the
-    proxy's internal IP (10.x.x.x), not the real client.
+    proxy's internal IP, not the real client.
     """
     forwarded = request.headers.get("X-Forwarded-For", "").strip()
     if forwarded:
