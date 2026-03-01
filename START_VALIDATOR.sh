@@ -26,7 +26,7 @@ else
 fi
 
 # Set defaults if not in .env (mainnet defaults)
-export VALIDATOR_API_URL=${VALIDATOR_API_URL:-"http://localhost:8000"}
+export VALIDATOR_API_URL=${VALIDATOR_API_URL:-"https://quasar-validator-api.onrender.com"}
 export NETUID=${NETUID:-24}
 export SUBTENSOR_NETWORK=${SUBTENSOR_NETWORK:-"finney"}
 export WALLET_VALIDATOR_NAME=${WALLET_VALIDATOR_NAME:-"quasar_validator"}
@@ -71,7 +71,7 @@ if curl -s "$VALIDATOR_API_URL/health" > /dev/null 2>&1; then
     echo "✅ Validator API is running"
 else
     echo "❌ Validator API is not running!"
-    echo "   Please start it first: ./START_SERVER.sh"
+    echo "   Please check Validator API is running and try again."
     exit 1
 fi
 
