@@ -11,6 +11,7 @@ import os
 import random
 import time
 import hashlib
+import ipaddress
 import requests
 import json
 from collections import defaultdict
@@ -47,6 +48,40 @@ models.Base.metadata.create_all(bind=engine)
 # IP Banning Configuration
 MAX_FAILURES_BEFORE_BAN = 5
 BAN_DURATION_HOURS = 24
+
+
+def get_client_ip(request: Request) -> Optional[str]:
+    """
+    Extract the real client IP from a request, correctly handling reverse proxies.
+    Priority: X-Forwarded-For (first entry) > X-Real-IP > request.client.host.
+    Behind reverse proxies (e.g. Render, Cloudflare), request.client.host is the
+    proxy's internal IP (10.x.x.x), not the real client.
+    """
+    forwarded = request.headers.get("X-Forwarded-For", "").strip()
+    if forwarded:
+        ip = forwarded.split(",")[0].strip()
+        if ip:
+            return ip
+
+    real_ip = request.headers.get("X-Real-IP", "").strip()
+    if real_ip:
+        return real_ip
+
+    if hasattr(request, "client") and request.client:
+        return request.client.host
+
+    return None
+
+
+def is_private_ip(ip: Optional[str]) -> bool:
+    """Return True if the IP is a private/internal address (RFC 1918, loopback, etc.)."""
+    if not ip:
+        return True
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
+
 
 def check_ip_ban(ip_address: str, db: Session) -> tuple[bool, Optional[str]]:
     """
@@ -619,15 +654,7 @@ def submit_kernel(
             db.commit()
             print(f"✅ [SUBMIT_KERNEL] Auto-registered miner {hotkey[:8]}... on {network} (UID will be synced from metagraph)")
 
-        # Extract IP address from request (for IP banning)
-        client_ip = None
-        if hasattr(request, 'client') and request.client:
-            client_ip = request.client.host
-        # Also check X-Forwarded-For header (for proxies/load balancers)
-        if not client_ip:
-            client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        if not client_ip:
-            client_ip = request.headers.get("X-Real-IP", "").strip()
+        client_ip = get_client_ip(request)
         
         # Check IP ban BEFORE processing submission
         is_banned, ban_reason = check_ip_ban(client_ip, db)
@@ -668,8 +695,8 @@ def submit_kernel(
                 miner_reg.github_username = gh_user
                 db.commit()
 
-        # IP registration dedup ──
-        if client_ip and miner_reg:
+        # IP registration dedup (skip for private/proxy IPs to avoid false positives)
+        if client_ip and miner_reg and not is_private_ip(client_ip):
             if not miner_reg.registration_ip:
                 miner_reg.registration_ip = client_ip
                 db.commit()
@@ -866,12 +893,8 @@ def commit_submission(
             db.commit()
             print(f"✅ [COMMIT] Auto-registered miner {hotkey[:8]}... on {network} (UID will be synced from metagraph)")
         
-        # Extract IP address
-        client_ip = None
-        if hasattr(request, 'client') and request.client:
-            client_ip = request.client.host
-        if not client_ip:
-            client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        # Extract IP address (correctly handle reverse proxies)
+        client_ip = get_client_ip(request)
         
         # Check IP ban
         is_banned, ban_reason = check_ip_ban(client_ip, db)
@@ -989,9 +1012,7 @@ def reveal_submission(
         
         if expected_hash != submission.commitment_hash:
             # Record failure for IP banning
-            client_ip = None
-            if hasattr(request, 'client') and request.client:
-                client_ip = request.client.host
+            client_ip = get_client_ip(request)
             if client_ip:
                 record_failure(client_ip, db)
             
