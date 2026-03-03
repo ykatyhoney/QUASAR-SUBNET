@@ -892,16 +892,17 @@ class Validator(BaseValidatorNeuron):
                     "repo_hash": repo_hash
                 }
 
-            # Build miner's multi-step logits map
+            # Require multi-step logits -- no fallback to legacy single-step.
+            # A miner returning only `captured_logits` (single step) while
+            # ignoring `logits_at_steps` would bypass the multi-step check.
             miner_multi = miner_result.captured_logits_multi or {}
-            if not miner_multi and miner_result.captured_logits is not None:
-                miner_multi = {logits_at_step: miner_result.captured_logits}
 
             if not miner_multi:
-                print(f"[VALIDATOR]   Miner container did not return captured_logits", flush=True)
+                print(f"[VALIDATOR]   Miner container did not return captured_logits_multi "
+                      f"(legacy single-step not accepted)", flush=True)
                 return {
                     "verified": False,
-                    "reason": "Miner container did not return captured_logits",
+                    "reason": "Container must return captured_logits_multi for all requested steps",
                     "repo_hash": repo_hash
                 }
 

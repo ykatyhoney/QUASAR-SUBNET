@@ -18,8 +18,8 @@ containers, measuring generation throughput while verifying correctness
 by comparing logits at a random decode step.
 
 Container interface: POST /inference
-  Request:  {prompt: List[int], gen_len: int, logits_at_step: int}
-  Response: {tokens: List[int], captured_logits: List[float], elapsed_sec: float}
+  Request:  {prompt: List[int], gen_len: int, logits_at_step: int, logits_at_steps: List[int]}
+  Response: {tokens: List[int], captured_logits_multi: Dict[int, List[float]], elapsed_sec: float}
 
 Verification: cosine similarity + max absolute diff on captured logits
 Scoring: throughput (tok/sec) if verified, infinity if failed
@@ -446,8 +446,12 @@ def run_container_inference(
         6. Always stop and remove the container in the finally block.
 
     The miner container must expose a FastAPI server on port 8000 with:
-        POST /inference  -> {tokens, captured_logits, elapsed_sec}
+        POST /inference  -> {tokens, captured_logits_multi: {step: logits}, elapsed_sec}
         GET  /health     -> {status: "healthy", ...}
+
+    The container MUST return captured_logits_multi with logits for every
+    step listed in the request's logits_at_steps array. Returning only the
+    legacy single captured_logits field will fail verification.
     """
     import requests as _requests
 
