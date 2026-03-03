@@ -56,7 +56,8 @@ class InferenceVerificationConfig:
     # Inference configuration
     prompt_length: int = 128  # Random prompt token length
     generate_length: int = 512  # Number of tokens to generate
-    logit_capture_range: Tuple[int, int] = (1, 50)  # Range for random logit capture step
+    logit_capture_range: Tuple[int, int] = (1, 50)  # Legacy single-step range (unused)
+    num_logit_checks: int = 3  # Number of random steps to capture logits at
     inference_timeout: int = 300  # Timeout in seconds
 
     # Verification thresholds (from const's implementation)
@@ -252,22 +253,27 @@ class ReferenceModel:
         self,
         prompt: List[int],
         gen_len: int,
-        logits_at_step: int
+        logits_at_step: int,
+        logits_at_steps: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         """
-        Run inference and capture logits at a specific step.
+        Run inference and capture logits at one or more steps.
 
-        The validator runs the same inference as the miner and compares
-        logits at a random step.
+        Args:
+            logits_at_step:  Legacy single-step capture (used if logits_at_steps is None).
+            logits_at_steps: List of 1-indexed steps to capture logits at.
         """
         if not self._loaded:
             await self.load()
+
+        capture_set = set(logits_at_steps) if logits_at_steps else {logits_at_step}
 
         device = next(self.model.parameters()).device
         input_ids = torch.tensor([prompt], device=device)
 
         generated_tokens = []
         captured_logits = None
+        captured_logits_multi: Dict[int, List[float]] = {}
         past_key_values = None
 
         start_time = time.perf_counter()
@@ -278,8 +284,12 @@ class ReferenceModel:
             next_token_logits = outputs.logits[:, -1, :]
 
             for step in range(gen_len):
-                if step + 1 == logits_at_step:
-                    captured_logits = next_token_logits[0].cpu().float().tolist()
+                step_1indexed = step + 1
+                if step_1indexed in capture_set:
+                    logits_list = next_token_logits[0].cpu().float().tolist()
+                    captured_logits_multi[step_1indexed] = logits_list
+                    if step_1indexed == (logits_at_steps[0] if logits_at_steps else logits_at_step):
+                        captured_logits = logits_list
 
                 next_token = next_token_logits.argmax(dim=-1)
                 generated_tokens.append(next_token.item())
@@ -297,7 +307,8 @@ class ReferenceModel:
         return {
             "tokens": generated_tokens,
             "captured_logits": captured_logits,
-            "elapsed_sec": elapsed_sec
+            "captured_logits_multi": captured_logits_multi,
+            "elapsed_sec": elapsed_sec,
         }
 
     def get_vocab_size(self) -> int:
@@ -325,13 +336,26 @@ def generate_verification_challenge(
     reference_model: ReferenceModel,
     config: InferenceVerificationConfig = CONFIG
 ) -> Dict[str, Any]:
-    """Generate a verification challenge for a miner."""
+    """Generate a verification challenge for a miner.
+
+    Captures logits at multiple random steps spread across the full generation
+    range so miners can't stop generating early or skip intermediate tokens.
+    """
     vocab_size = reference_model.get_vocab_size() or 32000
+    gen_len = config.generate_length
+
+    # Pick N distinct steps uniformly across [1, gen_len-1].
+    # One early, rest spread through the full range -- miners must run the
+    # entire generation to pass all checks.
+    n_checks = max(1, config.num_logit_checks)
+    all_steps = list(range(1, gen_len))
+    capture_steps = sorted(random.sample(all_steps, min(n_checks, len(all_steps))))
 
     return {
         "prompt": generate_random_prompt(config.prompt_length, vocab_size),
-        "gen_len": config.generate_length,
-        "logits_at_step": random.randint(*config.logit_capture_range)
+        "gen_len": gen_len,
+        "logits_at_step": capture_steps[0],
+        "logits_at_steps": capture_steps,
     }
 
 
@@ -353,6 +377,7 @@ class ContainerInferenceResult:
     success: bool
     tokens: List[int] = field(default_factory=list)
     captured_logits: Optional[List[float]] = None
+    captured_logits_multi: Dict[int, List[float]] = field(default_factory=dict)
     elapsed_sec: float = 0.0
     error: Optional[str] = None
 
@@ -405,6 +430,7 @@ def run_container_inference(
     prompt: List[int],
     gen_len: int,
     logits_at_step: int,
+    logits_at_steps: Optional[List[int]] = None,
     timeout: int = CONFIG.inference_timeout,
     gpu_enabled: bool = CONTAINER_GPU_ENABLED,
 ) -> ContainerInferenceResult:
@@ -495,15 +521,19 @@ def run_container_inference(
             )
         log("Container healthy", "success")
 
-        # 4. Call /inference
+        # 4. Call /inference -- validator measures wall-clock time independently
         inference_url = f"http://127.0.0.1:{host_port}/inference"
-        payload = {
+        payload: Dict[str, Any] = {
             "prompt": prompt,
             "gen_len": gen_len,
             "logits_at_step": logits_at_step,
         }
+        if logits_at_steps:
+            payload["logits_at_steps"] = logits_at_steps
         log(f"Calling /inference (timeout={timeout}s)...", "info")
+        wall_start = time.perf_counter()
         resp = _requests.post(inference_url, json=payload, timeout=timeout)
+        wall_elapsed = time.perf_counter() - wall_start
         if resp.status_code != 200:
             return ContainerInferenceResult(
                 success=False,
@@ -511,11 +541,28 @@ def run_container_inference(
             )
 
         data = resp.json()
+        miner_claimed_sec = float(data.get("elapsed_sec", 0))
+        # Use validator-measured wall time, not the miner's self-reported value.
+        # Wall time includes HTTP overhead (~ms), but that's a conservative
+        # penalty the miner can't game. Log the discrepancy for auditing.
+        if miner_claimed_sec > 0 and wall_elapsed > 0:
+            ratio = miner_claimed_sec / wall_elapsed
+            if ratio < 0.5:
+                log(f"Miner claimed {miner_claimed_sec:.2f}s but wall time was {wall_elapsed:.2f}s "
+                    f"(ratio {ratio:.2f}) — likely inflated speed", "warn")
+
+        # Parse multi-step logits if the container supports it
+        captured_logits_multi: Dict[int, List[float]] = {}
+        raw_multi = data.get("captured_logits_multi")
+        if isinstance(raw_multi, dict):
+            captured_logits_multi = {int(k): v for k, v in raw_multi.items()}
+
         return ContainerInferenceResult(
             success=True,
             tokens=data.get("tokens", []),
             captured_logits=data.get("captured_logits"),
-            elapsed_sec=float(data.get("elapsed_sec", 0)),
+            captured_logits_multi=captured_logits_multi,
+            elapsed_sec=wall_elapsed,
         )
 
     except Exception as e:

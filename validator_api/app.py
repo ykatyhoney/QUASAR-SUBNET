@@ -517,7 +517,7 @@ app.add_middleware(
     allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Hotkey", "Signature", "Timestamp", "Authorization"],
+    allow_headers=["Content-Type", "Hotkey", "Signature", "Timestamp", "Authorization", "X-API-Key"],
     max_age=600,
 )
 
@@ -1361,6 +1361,7 @@ def get_pending_validations(
         db.query(models.SpeedSubmission)
         .filter(models.SpeedSubmission.network == network)
         .filter(models.SpeedSubmission.validated == False)
+        .filter(models.SpeedSubmission.is_revealed == True)
         .order_by(models.SpeedSubmission.created_at.desc())
     )
     if flagged_hotkeys:
@@ -1378,11 +1379,13 @@ def get_pending_validations(
                 "fork_url": s.fork_url,
                 "commit_hash": s.commit_hash,
                 "repo_hash": s.repo_hash,
+                "docker_image": s.docker_image,
                 "target_sequence_length": s.target_sequence_length,
                 "tokens_per_sec": s.tokens_per_sec,
                 "vram_mb": s.vram_mb,
                 "benchmarks": s.benchmarks,
                 "validated": s.validated,
+                "is_revealed": s.is_revealed,
                 "created_at": s.created_at.isoformat()
             }
             for s in submissions
@@ -2202,22 +2205,19 @@ def calculate_rankings(
         effective_tps = sub.validated_tokens_per_sec
 
         # Skip if below baseline (for round 2+)
-        # Baseline must also be validated (no fallback to claimed)
         if baseline:
-            if baseline.validated_tokens_per_sec is None:
-                # Baseline not validated yet, skip comparison
-                continue
-            baseline_tps = baseline.validated_tokens_per_sec
-            baseline_league = get_league_for_seq_len(baseline.target_sequence_length)
-            baseline_multiplier = LEAGUE_MULTIPLIERS.get(baseline_league, 1.0)
-            baseline_weighted = baseline_tps * baseline_multiplier
+            baseline_tps = baseline.validated_tokens_per_sec or baseline.tokens_per_sec
+            if baseline_tps is not None:
+                baseline_league = get_league_for_seq_len(baseline.target_sequence_length)
+                baseline_multiplier = LEAGUE_MULTIPLIERS.get(baseline_league, 1.0)
+                baseline_weighted = baseline_tps * baseline_multiplier
 
-            sub_league = get_league_for_seq_len(sub.target_sequence_length)
-            sub_multiplier = LEAGUE_MULTIPLIERS.get(sub_league, 1.0)
-            sub_weighted = effective_tps * sub_multiplier
+                sub_league = get_league_for_seq_len(sub.target_sequence_length)
+                sub_multiplier = LEAGUE_MULTIPLIERS.get(sub_league, 1.0)
+                sub_weighted = effective_tps * sub_multiplier
 
-            if sub_weighted <= baseline_weighted:
-                continue
+                if sub_weighted <= baseline_weighted:
+                    continue
 
         league = get_league_for_seq_len(sub.target_sequence_length)
         multiplier = LEAGUE_MULTIPLIERS.get(league, 1.0)
@@ -2504,4 +2504,207 @@ def refinalize_round(round_id: int, db: Session = Depends(get_db), hotkey: str =
         "round_id": round_id,
         "winner_hotkey": round_obj.winner_hotkey,
         "rankings": rankings[:4]  # Top 4
+    }
+
+
+# ==================== DASHBOARD ENDPOINTS ====================
+# Authenticated read-only endpoints for frontend dashboard.
+# Accepts: API key (Authorization: Bearer <key>) or validator signature.
+
+@app.get("/dashboard/overview")
+def dashboard_overview(
+    network: Optional[str] = None,
+    db: Session = Depends(get_db),
+    role: str = Depends(auth.verify_dashboard_read),
+):
+    """Aggregated dashboard overview: current round, recent rounds, top miners, stats."""
+    network = normalize_network(network)
+
+    current_round = ensure_current_round(db, network)
+    now = datetime.utcnow()
+    time_remaining = max(0, int((current_round.end_time - now).total_seconds()))
+
+    current_round_submissions = (
+        db.query(models.SpeedSubmission)
+        .filter(models.SpeedSubmission.round_id == current_round.id)
+        .count()
+    )
+
+    recent_rounds = (
+        db.query(models.CompetitionRound)
+        .filter(models.CompetitionRound.network == network)
+        .filter(models.CompetitionRound.status == "completed")
+        .order_by(models.CompetitionRound.round_number.desc())
+        .limit(5)
+        .all()
+    )
+
+    recent_rounds_data = []
+    for r in recent_rounds:
+        sub_count = db.query(models.SpeedSubmission).filter(
+            models.SpeedSubmission.round_id == r.id
+        ).count()
+        recent_rounds_data.append({
+            "round_id": r.id,
+            "round_number": r.round_number,
+            "start_time": r.start_time.isoformat(),
+            "end_time": r.end_time.isoformat(),
+            "winner_hotkey": r.winner_hotkey,
+            "total_submissions": sub_count,
+        })
+
+    total_miners = db.query(models.MinerRegistration).filter(
+        models.MinerRegistration.network == network,
+        models.MinerRegistration.is_flagged == False,
+    ).count()
+
+    total_submissions = db.query(models.SpeedSubmission).filter(
+        models.SpeedSubmission.network == network,
+    ).count()
+
+    validated_submissions = db.query(models.SpeedSubmission).filter(
+        models.SpeedSubmission.network == network,
+        models.SpeedSubmission.validated == True,
+    ).count()
+
+    cutoff = now - timedelta(hours=24)
+    submissions_24h = db.query(models.SpeedSubmission).filter(
+        models.SpeedSubmission.network == network,
+        models.SpeedSubmission.created_at >= cutoff,
+    ).count()
+
+    return {
+        "network": network,
+        "current_round": {
+            "round_id": current_round.id,
+            "round_number": current_round.round_number,
+            "status": current_round.status,
+            "start_time": current_round.start_time.isoformat(),
+            "end_time": current_round.end_time.isoformat(),
+            "time_remaining_seconds": time_remaining,
+            "total_submissions": current_round_submissions,
+        },
+        "recent_completed_rounds": recent_rounds_data,
+        "stats": {
+            "total_registered_miners": total_miners,
+            "total_submissions": total_submissions,
+            "validated_submissions": validated_submissions,
+            "submissions_last_24h": submissions_24h,
+        },
+    }
+
+
+@app.get("/dashboard/leaderboard")
+def dashboard_leaderboard(
+    network: Optional[str] = None,
+    round_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    role: str = Depends(auth.verify_dashboard_read),
+):
+    """Leaderboard for a given round (defaults to latest completed round)."""
+    network = normalize_network(network)
+
+    if round_id:
+        round_obj = db.query(models.CompetitionRound).filter(
+            models.CompetitionRound.id == round_id,
+            models.CompetitionRound.network == network,
+        ).first()
+    else:
+        round_obj = (
+            db.query(models.CompetitionRound)
+            .filter(models.CompetitionRound.network == network)
+            .filter(models.CompetitionRound.status == "completed")
+            .order_by(models.CompetitionRound.round_number.desc())
+            .first()
+        )
+
+    if not round_obj:
+        return {"round": None, "leaderboard": []}
+
+    submissions = (
+        db.query(models.SpeedSubmission)
+        .filter(models.SpeedSubmission.round_id == round_obj.id)
+        .filter(models.SpeedSubmission.validated == True)
+        .all()
+    )
+
+    rankings = calculate_rankings(submissions, round_obj.baseline_submission_id, db)
+
+    leaderboard = []
+    for entry in rankings[:20]:
+        leaderboard.append({
+            "rank": entry["rank"],
+            "miner_hotkey": entry["miner_hotkey"],
+            "tokens_per_sec": entry["tokens_per_sec"],
+            "target_sequence_length": entry["target_sequence_length"],
+            "league": entry["league"],
+            "weighted_score": entry["weighted_score"],
+            "logit_verified": entry.get("logit_verification_passed"),
+            "cosine_similarity": entry.get("cosine_similarity"),
+        })
+
+    return {
+        "round": {
+            "round_id": round_obj.id,
+            "round_number": round_obj.round_number,
+            "status": round_obj.status,
+            "winner_hotkey": round_obj.winner_hotkey,
+            "start_time": round_obj.start_time.isoformat(),
+            "end_time": round_obj.end_time.isoformat(),
+        },
+        "leaderboard": leaderboard,
+    }
+
+
+@app.get("/dashboard/miner/{hotkey}")
+def dashboard_miner_detail(
+    hotkey: str,
+    network: Optional[str] = None,
+    db: Session = Depends(get_db),
+    role: str = Depends(auth.verify_dashboard_read),
+):
+    """Per-miner detail view for dashboard."""
+    network = normalize_network(network)
+
+    reg = db.query(models.MinerRegistration).filter(
+        models.MinerRegistration.hotkey == hotkey,
+        models.MinerRegistration.network == network,
+    ).first()
+
+    if not reg:
+        raise HTTPException(status_code=404, detail="Miner not found")
+
+    recent_submissions = (
+        db.query(models.SpeedSubmission)
+        .filter(models.SpeedSubmission.miner_hotkey == hotkey)
+        .filter(models.SpeedSubmission.network == network)
+        .order_by(models.SpeedSubmission.created_at.desc())
+        .limit(20)
+        .all()
+    )
+
+    submissions_data = []
+    for s in recent_submissions:
+        submissions_data.append({
+            "id": s.id,
+            "round_id": s.round_id,
+            "tokens_per_sec": s.tokens_per_sec,
+            "validated_tokens_per_sec": s.validated_tokens_per_sec,
+            "target_sequence_length": s.target_sequence_length,
+            "validated": s.validated,
+            "score": s.score,
+            "logit_verification_passed": s.logit_verification_passed,
+            "cosine_similarity": s.cosine_similarity,
+            "is_baseline": s.is_baseline,
+            "created_at": s.created_at.isoformat(),
+        })
+
+    return {
+        "hotkey": reg.hotkey,
+        "uid": reg.uid,
+        "network": network,
+        "is_flagged": reg.is_flagged,
+        "flag_reason": reg.flag_reason if reg.is_flagged else None,
+        "registered_at": reg.created_at.isoformat() if reg.created_at else None,
+        "recent_submissions": submissions_data,
     }

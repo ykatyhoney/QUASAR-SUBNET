@@ -790,40 +790,46 @@ class Validator(BaseValidatorNeuron):
                     print(f"[VALIDATOR]   ⚠️  Failed to clone/build context: {e}", flush=True)
                     repo_context = None
             
-            # Generate challenge (with context if available)
-            # Note: For now, generate_verification_challenge doesn't use context,
-            # but we'll pass it for future enhancement
+            # Early exit: if no docker_image, skip the entire verification
+            # (avoids wasting GPU time running reference inference for nothing)
+            if not docker_image:
+                print(f"[VALIDATOR]   No docker_image for submission {submission_id} - skipping container verification", flush=True)
+                return {
+                    "verified": None,
+                    "reason": "No docker_image provided - container verification skipped",
+                    "repo_hash": repo_hash
+                }
+
+            # Generate challenge with multiple capture steps
             challenge = generate_verification_challenge(self.reference_model)
             prompt = challenge["prompt"]
             gen_len = challenge["gen_len"]
             logits_at_step = challenge["logits_at_step"]
+            logits_at_steps = challenge.get("logits_at_steps") or [logits_at_step]
             
-            # If we have context, prepend it to the prompt for reference model
-            # This ensures the reference model sees the same context as the miner
             if repo_context:
-                # For verification, we use a simplified context-aware prompt
-                # The actual prompt tokens are random, but the model should have seen the repo context
                 print(f"[VALIDATOR]   Using context-aware verification (repo_hash: {repo_hash})", flush=True)
             
-            print(f"[VALIDATOR]   Challenge: prompt_len={len(prompt)}, gen_len={gen_len}, capture_step={logits_at_step}", flush=True)
+            print(f"[VALIDATOR]   Challenge: prompt_len={len(prompt)}, gen_len={gen_len}, "
+                  f"capture_steps={logits_at_steps}", flush=True)
             
             # Run reference model inference - handle event loop conflicts
             try:
-                # Try to get the running event loop
                 asyncio.get_running_loop()
-                # If we're in an async context, we need to run in a separate thread
                 import concurrent.futures
                 import threading
                 
                 future = concurrent.futures.Future()
                 
                 def run_inference():
-                    """Run inference in a separate thread with its own event loop."""
                     try:
                         new_loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(new_loop)
                         result = new_loop.run_until_complete(
-                            self.reference_model.inference(prompt, gen_len, logits_at_step)
+                            self.reference_model.inference(
+                                prompt, gen_len, logits_at_step,
+                                logits_at_steps=logits_at_steps,
+                            )
                         )
                         new_loop.close()
                         future.set_result(result)
@@ -832,7 +838,7 @@ class Validator(BaseValidatorNeuron):
                 
                 thread = threading.Thread(target=run_inference, daemon=True)
                 thread.start()
-                thread.join(timeout=300)  # 5 minute timeout
+                thread.join(timeout=300)
                 
                 if thread.is_alive():
                     raise TimeoutError("Inference timed out after 5 minutes")
@@ -843,28 +849,24 @@ class Validator(BaseValidatorNeuron):
                 reference_result = future.result()
                 
             except RuntimeError:
-                # No running event loop, create a new one
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 reference_result = loop.run_until_complete(
-                    self.reference_model.inference(prompt, gen_len, logits_at_step)
+                    self.reference_model.inference(
+                        prompt, gen_len, logits_at_step,
+                        logits_at_steps=logits_at_steps,
+                    )
                 )
                 loop.close()
             
-            if reference_result.get("captured_logits") is None:
+            ref_multi = reference_result.get("captured_logits_multi", {})
+            if not ref_multi and reference_result.get("captured_logits") is not None:
+                ref_multi = {logits_at_step: reference_result["captured_logits"]}
+            
+            if not ref_multi:
                 return {
                     "verified": False,
                     "reason": "Reference model failed to capture logits"
-                }
-            
-            if not docker_image:
-                print(f"[VALIDATOR]   No docker_image for submission {submission_id} - skipping container verification", flush=True)
-                return {
-                    "verified": None,
-                    "reason": "No docker_image provided - container verification skipped",
-                    "reference_throughput": gen_len / reference_result["elapsed_sec"],
-                    "reference_elapsed_sec": reference_result["elapsed_sec"],
-                    "repo_hash": repo_hash
                 }
 
             from quasar.inference_verification import run_container_inference as _run_container
@@ -876,19 +878,26 @@ class Validator(BaseValidatorNeuron):
                 prompt=prompt,
                 gen_len=gen_len,
                 logits_at_step=logits_at_step,
+                logits_at_steps=logits_at_steps,
             )
 
             if not miner_result.success:
                 print(f"[VALIDATOR]   Container execution failed: {miner_result.error}", flush=True)
+                ref_elapsed = reference_result.get("elapsed_sec", 1)
                 return {
                     "verified": False,
                     "reason": f"Container execution failed: {miner_result.error}",
-                    "reference_throughput": gen_len / reference_result["elapsed_sec"],
-                    "reference_elapsed_sec": reference_result["elapsed_sec"],
+                    "reference_throughput": gen_len / ref_elapsed if ref_elapsed > 0 else 0,
+                    "reference_elapsed_sec": ref_elapsed,
                     "repo_hash": repo_hash
                 }
 
-            if miner_result.captured_logits is None:
+            # Build miner's multi-step logits map
+            miner_multi = miner_result.captured_logits_multi or {}
+            if not miner_multi and miner_result.captured_logits is not None:
+                miner_multi = {logits_at_step: miner_result.captured_logits}
+
+            if not miner_multi:
                 print(f"[VALIDATOR]   Miner container did not return captured_logits", flush=True)
                 return {
                     "verified": False,
@@ -896,31 +905,65 @@ class Validator(BaseValidatorNeuron):
                     "repo_hash": repo_hash
                 }
 
-            verification = verify_logits(
-                miner_result.captured_logits,
-                reference_result["captured_logits"]
-            )
+            # Verify ALL captured steps -- miner must pass every one
+            all_passed = True
+            worst_cosine = 1.0
+            worst_max_diff = 0.0
+            fail_reason = None
+            steps_checked = 0
+
+            for step in logits_at_steps:
+                ref_logits = ref_multi.get(step)
+                miner_logits = miner_multi.get(step)
+
+                if ref_logits is None:
+                    continue
+                if miner_logits is None:
+                    all_passed = False
+                    fail_reason = f"Missing logits at step {step}"
+                    print(f"[VALIDATOR]   Step {step}: FAIL (miner returned no logits)", flush=True)
+                    break
+
+                step_result = verify_logits(
+                    miner_logits, ref_logits,
+                    cosine_threshold=self.cosine_sim_threshold,
+                    max_diff_threshold=self.max_abs_diff_threshold,
+                )
+                steps_checked += 1
+                worst_cosine = min(worst_cosine, step_result.cosine_sim or 1.0)
+                worst_max_diff = max(worst_max_diff, step_result.max_abs_diff or 0.0)
+
+                if not step_result.verified:
+                    all_passed = False
+                    fail_reason = f"Step {step}: {step_result.reason}"
+                    print(f"[VALIDATOR]   Step {step}: FAIL (cosine={step_result.cosine_sim:.4f}, "
+                          f"max_diff={step_result.max_abs_diff:.4f})", flush=True)
+                    break
+                else:
+                    print(f"[VALIDATOR]   Step {step}: PASS (cosine={step_result.cosine_sim:.4f}, "
+                          f"max_diff={step_result.max_abs_diff:.4f})", flush=True)
 
             miner_throughput = gen_len / miner_result.elapsed_sec if miner_result.elapsed_sec > 0 else 0
             ref_throughput = gen_len / reference_result["elapsed_sec"] if reference_result["elapsed_sec"] > 0 else 0
 
             print(
-                f"[VALIDATOR]   Verification: cosine={verification.cosine_sim:.4f}, "
-                f"max_diff={verification.max_abs_diff:.4f}, "
-                f"verified={verification.verified}",
+                f"[VALIDATOR]   Result: {'PASS' if all_passed else 'FAIL'} "
+                f"({steps_checked} steps checked, worst_cosine={worst_cosine:.4f}, "
+                f"worst_max_diff={worst_max_diff:.4f})",
                 flush=True,
             )
             print(
-                f"[VALIDATOR]   Throughput: miner={miner_throughput:.1f} tok/s, "
+                f"[VALIDATOR]   Throughput: miner={miner_throughput:.1f} tok/s (validator-timed), "
                 f"reference={ref_throughput:.1f} tok/s",
                 flush=True,
             )
 
             return {
-                "verified": verification.verified,
-                "reason": verification.reason,
-                "cosine_similarity": verification.cosine_sim,
-                "max_abs_diff": verification.max_abs_diff,
+                "verified": all_passed,
+                "reason": None if all_passed else fail_reason,
+                "cosine_similarity": worst_cosine,
+                "max_abs_diff": worst_max_diff,
+                "steps_checked": steps_checked,
                 "miner_throughput": miner_throughput,
                 "reference_throughput": ref_throughput,
                 "reference_elapsed_sec": reference_result["elapsed_sec"],
@@ -939,26 +982,25 @@ class Validator(BaseValidatorNeuron):
             }
     
     def record_verification_result(self, submission_id: int, result: Dict):
-        """Record logit verification result to the API."""
+        """Record logit verification result to the API.
+
+        verified=None means verification was not applicable (e.g. no docker_image).
+        The ranking logic treats None as "allowed" (only False blocks a miner).
+        We skip recording entirely for None since there's nothing meaningful to store.
+        """
         try:
-            # API expects verified to be bool, not None.
-            # When verification is not applicable (e.g. no docker_image), treat
-            # as passed so the submission can participate in rankings. Only an
-            # explicit False (verification ran and failed) should block a miner.
             verified = result.get("verified")
             if verified is None:
-                verified = True
                 reason = result.get("reason", "Verification not applicable")
                 print(f"[VALIDATOR] ℹ️ Logit verification not applicable for submission {submission_id} "
-                      f"({reason}) - recording as passed", flush=True)
-                result = {**result, "verified": True, "reason": reason}
+                      f"({reason}) - skipping record (rankings allow None)", flush=True)
+                return
             
             params = {
                 "submission_id": submission_id,
                 "verified": bool(verified),
             }
             
-            # Add optional fields only if they exist
             if result.get("cosine_similarity") is not None:
                 params["cosine_similarity"] = result.get("cosine_similarity")
             if result.get("max_abs_diff") is not None:
@@ -975,10 +1017,12 @@ class Validator(BaseValidatorNeuron):
                 timeout=30
             )
             if response.status_code == 200:
-                print(f"[VALIDATOR] ✅ Verification result recorded for submission {submission_id}", flush=True)
+                print(f"[VALIDATOR] ✅ Verification result recorded for submission {submission_id}: verified={verified}", flush=True)
             else:
+                bt.logging.warning(f"Failed to record verification for {submission_id}: {response.status_code} - {response.text}")
                 print(f"[VALIDATOR] ⚠️ Failed to record verification: {response.status_code} - {response.text}", flush=True)
         except Exception as e:
+            bt.logging.warning(f"Failed to record verification result for {submission_id}: {e}")
             print(f"[VALIDATOR] ⚠️ Failed to record verification result: {e}", flush=True)
 
     def evaluate_performance_submissions(self) -> Dict[str, float]:
@@ -1385,26 +1429,33 @@ class Validator(BaseValidatorNeuron):
                 for hotkey, score in evaluated_scores.items():
                     print(f"[VALIDATOR]   {hotkey[:12]}...: score={score:.4f}", flush=True)
             
-            # Monitor round status (rounds auto-finalize when expired via ensure_current_round)
+            # Ensure round finalization runs: calling get_current_round triggers
+            # ensure_current_round on the API, which finalizes expired rounds and
+            # creates a new active round if needed.
             try:
                 net = getattr(self.subtensor, "network", None) or "finney"
                 network = "test" if str(net).lower() == "test" else "finney"
                 response = requests.get(
                     f"{VALIDATOR_API_URL}/get_current_round",
                     params={"network": network},
-                    timeout=10
+                    timeout=15
                 )
                 if response.status_code == 200:
                     round_data = response.json()
                     time_remaining = round_data.get("time_remaining_seconds", 3600)
-                    round_status = round_data.get("status", "active")
+                    round_number = round_data.get("round_number")
+                    total_submissions = round_data.get("total_submissions", 0)
                     
-                    if round_status == "active":
-                        if time_remaining <= 0:
-                            print(f"[VALIDATOR] ⏰ Round {round_data.get('round_number')} has expired (will auto-finalize)", flush=True)
-                        elif time_remaining < 3600:
-                            hours_remaining = time_remaining / 3600
-                            print(f"[VALIDATOR] ⏰ Round {round_data.get('round_number')} ending soon: {hours_remaining:.1f}h remaining", flush=True)
+                    if time_remaining <= 0:
+                        print(f"[VALIDATOR] ⏰ Round {round_number} expired - triggered finalization via API", flush=True)
+                    elif time_remaining < 3600:
+                        hours_remaining = time_remaining / 3600
+                        print(f"[VALIDATOR] ⏰ Round {round_number}: {hours_remaining:.1f}h remaining, {total_submissions} submissions", flush=True)
+                    else:
+                        hours_remaining = time_remaining / 3600
+                        print(f"[VALIDATOR] Round {round_number}: {hours_remaining:.1f}h remaining, {total_submissions} submissions", flush=True)
+                else:
+                    print(f"[VALIDATOR] ⚠️ Round check returned status {response.status_code}", flush=True)
             except Exception as e:
                 print(f"[VALIDATOR] ⚠️ Round check failed: {e}", flush=True)
             
