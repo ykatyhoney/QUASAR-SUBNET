@@ -16,10 +16,13 @@ def test_api():
     hotkey_ss58 = wallet.hotkey.ss58_address
     
     def get_headers():
-        signature = f"0x{wallet.hotkey.sign(hotkey_ss58).hex()}"
+        timestamp = str(int(time.time()))
+        message = f"{hotkey_ss58}:{timestamp}".encode()
+        signature = wallet.hotkey.sign(message).hex()
         return {
             "Hotkey": hotkey_ss58,
-            "Signature": signature
+            "Signature": signature,
+            "Timestamp": timestamp,
         }
 
     print("--- Testing Health ---")

@@ -43,9 +43,11 @@ def register_miner(hotkey_ss58, wallet_name, hotkey_name, model_name, league, ap
     
     print("✅ Wallet loaded")
     
-    # Generate signature
+    # Generate signature with timestamp nonce for replay protection
     try:
-        message = hotkey_ss58.encode('utf-8')
+        import time as _time
+        timestamp = str(int(_time.time()))
+        message = f"{hotkey_ss58}:{timestamp}".encode('utf-8')
         signature = wallet.hotkey.sign(message)
         signature_hex = signature.hex()
     except Exception as e:
@@ -59,7 +61,8 @@ def register_miner(hotkey_ss58, wallet_name, hotkey_name, model_name, league, ap
     headers = {
         "Content-Type": "application/json",
         "Hotkey": hotkey_ss58,
-        "Signature": signature_hex
+        "Signature": signature_hex,
+        "Timestamp": timestamp,
     }
     
     body = {

@@ -655,11 +655,14 @@ class Miner(BaseMinerNeuron):
         return signature.hex()
 
     def _get_auth_headers(self) -> dict:
-        """Get authentication headers for API requests."""
-        signature = self._sign_message(self.wallet.hotkey.ss58_address)
+        """Get authentication headers with timestamp nonce for replay protection."""
+        hotkey = self.wallet.hotkey.ss58_address
+        timestamp = str(int(time.time()))
+        signature = self._sign_message(f"{hotkey}:{timestamp}")
         return {
-            "Hotkey": self.wallet.hotkey.ss58_address,
+            "Hotkey": hotkey,
             "Signature": signature,
+            "Timestamp": timestamp,
         }
 
     def _api_request(self, method: str, path: str, *, headers: Optional[dict] = None, json: Optional[dict] = None, timeout: int = 120) -> requests.Response:

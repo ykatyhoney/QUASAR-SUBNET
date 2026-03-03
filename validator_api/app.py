@@ -509,12 +509,16 @@ except Exception as e:
 
 app = FastAPI(title="Quasar Validator API")
 
+_cors_origins_raw = os.environ.get("CORS_ALLOWED_ORIGINS", "").strip()
+CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()] if _cors_origins_raw else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Hotkey", "Signature", "Timestamp", "Authorization"],
+    max_age=600,
 )
 
 # Rate limiting for DDOS protection
@@ -1243,6 +1247,7 @@ def get_submission_stats(
     limit: int = 50,
     db: Session = Depends(get_db)
 ):
+    limit = min(limit, 200)
     """
     Get submission statistics for the system.
     Returns recent submissions with performance metrics.
@@ -1342,6 +1347,7 @@ def get_pending_validations(
     Validator-only endpoint: Get unvalidated submissions with full details (including fork_url) for the given network.
     Requires validator authentication. fork_url is never exposed to public endpoints.
     """
+    limit = min(limit, 100)
     network = normalize_network(network)
 
     # Exclude submissions from flagged miners
@@ -1735,7 +1741,7 @@ def get_flagged_miners(
 def flag_miner(
     req: dict,
     db: Session = Depends(get_db),
-    hotkey: str = Depends(auth.verify_validator_signature)
+    validator_hotkey: str = Depends(auth.verify_validator_signature)
 ):
     """Manually flag or unflag a miner. Requires validator authentication."""
     hotkey = req.get("hotkey")
@@ -2264,6 +2270,7 @@ def get_submission_rate(
     Returns:
         Dictionary with submissions_per_minute, recent_submissions, window_minutes
     """
+    window_minutes = max(1, min(window_minutes, 1440))
     cutoff_time = datetime.utcnow() - timedelta(minutes=window_minutes)
     
     recent_submissions = (
@@ -2364,6 +2371,7 @@ def get_completed_rounds(
     Get list of completed rounds with their winners.
     Useful for viewing round history and checking if winners were set.
     """
+    limit = min(limit, 100)
     network = normalize_network(network)
     
     rounds = (

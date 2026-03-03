@@ -190,10 +190,7 @@ class PerformanceValidator:
             headers = {}
             params = {"limit": limit}
             if self.validator_instance:
-                wallet = self.validator_instance.wallet
-                hotkey = wallet.hotkey.ss58_address
-                signature = wallet.hotkey.sign(hotkey.encode()).hex()
-                headers = {"Hotkey": hotkey, "Signature": signature}
+                headers = self.validator_instance._api_auth_headers()
                 if network is None:
                     net = getattr(self.validator_instance.subtensor, "network", None) or "finney"
                     network = "test" if str(net).lower() == "test" else "finney"
@@ -602,10 +599,12 @@ class Validator(BaseValidatorNeuron):
         bt.logging.info(f"📡 Validator API URL: {VALIDATOR_API_URL}")
     
     def _api_auth_headers(self) -> Dict[str, str]:
-        """Generate authentication headers for validator API calls."""
+        """Generate authentication headers with timestamp nonce for replay protection."""
         hotkey = self.wallet.hotkey.ss58_address
-        signature = self.wallet.hotkey.sign(hotkey.encode()).hex()
-        return {"Hotkey": hotkey, "Signature": signature}
+        timestamp = str(int(time.time()))
+        message = f"{hotkey}:{timestamp}".encode()
+        signature = self.wallet.hotkey.sign(message).hex()
+        return {"Hotkey": hotkey, "Signature": signature, "Timestamp": timestamp}
 
     def load_reference_model(self):
         """Load the reference model for logit verification (lazy loading)."""
