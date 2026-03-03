@@ -703,8 +703,8 @@ class Validator(BaseValidatorNeuron):
         """
         if not self.logit_verification_enabled:
             return {
-                "verified": None,  # None = not verified (verification disabled)
-                "reason": "Logit verification disabled"
+                "verified": False,
+                "reason": "Logit verification disabled but mandatory - enable ENABLE_LOGIT_VERIFICATION=true"
             }
         
         # Ensure reference model is loaded
@@ -712,8 +712,8 @@ class Validator(BaseValidatorNeuron):
         
         if self.reference_model is None:
             return {
-                "verified": None,
-                "reason": "Reference model not available"
+                "verified": False,
+                "reason": "Reference model failed to load - cannot verify"
             }
         
         try:
@@ -790,13 +790,13 @@ class Validator(BaseValidatorNeuron):
                     print(f"[VALIDATOR]   ⚠️  Failed to clone/build context: {e}", flush=True)
                     repo_context = None
             
-            # Early exit: if no docker_image, skip the entire verification
-            # (avoids wasting GPU time running reference inference for nothing)
+            # Logit verification is mandatory: miners MUST provide a docker_image.
+            # Without one, the submission cannot be verified and will not rank.
             if not docker_image:
-                print(f"[VALIDATOR]   No docker_image for submission {submission_id} - skipping container verification", flush=True)
+                print(f"[VALIDATOR]   No docker_image for submission {submission_id} - FAIL (mandatory)", flush=True)
                 return {
-                    "verified": None,
-                    "reason": "No docker_image provided - container verification skipped",
+                    "verified": False,
+                    "reason": "No docker_image provided - logit verification is mandatory",
                     "repo_hash": repo_hash
                 }
 
@@ -975,26 +975,26 @@ class Validator(BaseValidatorNeuron):
             print(f"[VALIDATOR] ❌ Logit verification failed: {e}", flush=True)
             traceback.print_exc()
             return {
-                "verified": None,
+                "verified": False,
                 "reason": f"Verification error: {str(e)}",
-                "context_used": False,
                 "repo_hash": repo_hash if 'repo_hash' in locals() else None
             }
     
     def record_verification_result(self, submission_id: int, result: Dict):
         """Record logit verification result to the API.
 
-        verified=None means verification was not applicable (e.g. no docker_image).
-        The ranking logic treats None as "allowed" (only False blocks a miner).
-        We skip recording entirely for None since there's nothing meaningful to store.
+        Logit verification is mandatory. All submissions must pass to rank.
+        verified=None (e.g. no docker_image, disabled, model unavailable) is
+        recorded as False so the submission is excluded from rankings.
         """
         try:
             verified = result.get("verified")
             if verified is None:
                 reason = result.get("reason", "Verification not applicable")
-                print(f"[VALIDATOR] ℹ️ Logit verification not applicable for submission {submission_id} "
-                      f"({reason}) - skipping record (rankings allow None)", flush=True)
-                return
+                print(f"[VALIDATOR] ⚠️ Logit verification not applicable for submission {submission_id} "
+                      f"({reason}) - recording as FAILED (verification is mandatory)", flush=True)
+                verified = False
+                result = {**result, "verified": False, "reason": f"mandatory_fail: {reason}"}
             
             params = {
                 "submission_id": submission_id,
@@ -1090,14 +1090,14 @@ class Validator(BaseValidatorNeuron):
                         # Record verification result to API
                         self.record_verification_result(submission_id, verification_result)
                         
-                        # If verification explicitly failed, reduce score to 0
-                        if verification_result.get("verified") == False:
-                            print(f"[VALIDATOR] ❌ Logit verification FAILED - score set to 0", flush=True)
+                        # Logit verification is mandatory: only True passes
+                        if verification_result.get("verified") == True:
+                            evaluated_scores[miner_hotkey] = normalized_score
+                        else:
+                            status = "FAILED" if verification_result.get("verified") == False else "NOT RUN"
+                            print(f"[VALIDATOR] ❌ Logit verification {status} - score set to 0", flush=True)
                             normalized_score = 0.0
                             evaluated_scores[miner_hotkey] = 0.0
-                        else:
-                            # Verification passed or pending - use original score
-                            evaluated_scores[miner_hotkey] = normalized_score
                     else:
                         evaluated_scores[miner_hotkey] = normalized_score
                     

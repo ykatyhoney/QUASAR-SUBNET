@@ -19,12 +19,6 @@ else:
 # ── Signature replay protection ──
 SIGNATURE_MAX_AGE_SECONDS = int(os.environ.get("SIGNATURE_MAX_AGE_SECONDS", "120"))
 
-# ── API keys for team members (dashboard devs, admins, etc.) ──
-# Format: comma-separated "key:role" pairs.
-#   role = "read"  -> can access read-only dashboard endpoints
-#   role = "admin" -> full access (same as validator)
-# If no role suffix, defaults to "read".
-# Example: API_KEYS="sk-abc123:read,sk-xyz789:admin"
 _API_KEYS_RAW = os.environ.get("API_KEYS", "").strip()
 API_KEY_ROLES: Dict[str, str] = {}
 for entry in _API_KEYS_RAW.split(","):

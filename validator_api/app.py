@@ -2186,13 +2186,12 @@ def calculate_rankings(
             print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Not revealed yet")
             continue
         
-        # Exclude submissions that explicitly FAILED logit verification.
-        # Submissions with logit_verification_passed=None are allowed (verification
-        # not applicable, e.g. fork_url submissions without docker_image).
-        # Spam is already prevented by requiring validated_tokens_per_sec (validator
-        # actually ran benchmarks) and the commit-reveal mechanism.
-        if sub.logit_verification_passed == False:
-            print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Failed logit verification")
+        # Logit verification is MANDATORY. Only submissions that explicitly
+        # passed (True) can participate in rankings. Submissions that failed
+        # (False) or were never verified (None) are excluded.
+        if sub.logit_verification_passed != True:
+            reason = "failed" if sub.logit_verification_passed == False else "not verified"
+            print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Logit verification {reason}")
             continue
         
         # ── ANTI-SPAM: Only use validator-measured TPS ──
