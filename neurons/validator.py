@@ -601,6 +601,12 @@ class Validator(BaseValidatorNeuron):
         
         bt.logging.info(f"📡 Validator API URL: {VALIDATOR_API_URL}")
     
+    def _api_auth_headers(self) -> Dict[str, str]:
+        """Generate authentication headers for validator API calls."""
+        hotkey = self.wallet.hotkey.ss58_address
+        signature = self.wallet.hotkey.sign(hotkey.encode()).hex()
+        return {"Hotkey": hotkey, "Signature": signature}
+
     def load_reference_model(self):
         """Load the reference model for logit verification (lazy loading)."""
         if self.reference_model is not None:
@@ -936,17 +942,21 @@ class Validator(BaseValidatorNeuron):
     def record_verification_result(self, submission_id: int, result: Dict):
         """Record logit verification result to the API."""
         try:
-            # API expects verified to be bool, not None
+            # API expects verified to be bool, not None.
+            # When verification is not applicable (e.g. no docker_image), treat
+            # as passed so the submission can participate in rankings. Only an
+            # explicit False (verification ran and failed) should block a miner.
             verified = result.get("verified")
             if verified is None:
-                # Skip recording if verification wasn't performed
-                print(f"[VALIDATOR] ⚠️ Skipping verification record - verification not performed (verified=None)", flush=True)
-                return
+                verified = True
+                reason = result.get("reason", "Verification not applicable")
+                print(f"[VALIDATOR] ℹ️ Logit verification not applicable for submission {submission_id} "
+                      f"({reason}) - recording as passed", flush=True)
+                result = {**result, "verified": True, "reason": reason}
             
-            # Build params dict, only including non-None values
             params = {
                 "submission_id": submission_id,
-                "verified": bool(verified),  # Ensure it's a bool
+                "verified": bool(verified),
             }
             
             # Add optional fields only if they exist
@@ -962,6 +972,7 @@ class Validator(BaseValidatorNeuron):
             response = requests.post(
                 f"{VALIDATOR_API_URL}/record_verification",
                 params=params,
+                headers=self._api_auth_headers(),
                 timeout=30
             )
             if response.status_code == 200:
@@ -1061,6 +1072,7 @@ class Validator(BaseValidatorNeuron):
                             response = requests.post(
                                 f"{VALIDATOR_API_URL}/mark_validated",
                                 json=mark_payload,
+                                headers=self._api_auth_headers(),
                                 timeout=30
                             )
                             if response.status_code == 200:
@@ -1080,6 +1092,7 @@ class Validator(BaseValidatorNeuron):
                             requests.post(
                                 f"{VALIDATOR_API_URL}/record_failure",
                                 json={"ip_address": ip_address},
+                                headers=self._api_auth_headers(),
                                 timeout=10
                             )
                             print(f"[VALIDATOR] 📝 Recorded failure for IP: {ip_address}", flush=True)
@@ -1094,8 +1107,9 @@ class Validator(BaseValidatorNeuron):
                                 f"{VALIDATOR_API_URL}/mark_validated",
                                 json={
                                     "submission_id": submission_id,
-                                    "score": 0.0  # Invalid submissions get score 0.0
+                                    "score": 0.0
                                 },
+                                headers=self._api_auth_headers(),
                                 timeout=30
                             )
                             if response.status_code == 200:
@@ -1344,7 +1358,8 @@ class Validator(BaseValidatorNeuron):
                     sync_resp = requests.post(
                         f"{VALIDATOR_API_URL}/sync_uids",
                         json={"network": network, "uid_map": uid_map},
-                        timeout=(5, 30)  # 5s connect, 30s read timeout
+                        headers=self._api_auth_headers(),
+                        timeout=(5, 30)
                     )
                     if sync_resp.status_code == 200:
                         sync_data = sync_resp.json()

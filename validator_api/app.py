@@ -49,13 +49,14 @@ models.Base.metadata.create_all(bind=engine)
 MAX_FAILURES_BEFORE_BAN = 5
 BAN_DURATION_HOURS = 24
 
+# TPS Sanity Bounds
+MIN_PLAUSIBLE_TPS = float(os.environ.get("MIN_PLAUSIBLE_TPS", "10.0"))
+MAX_PLAUSIBLE_TPS = float(os.environ.get("MAX_PLAUSIBLE_TPS", "50000000.0"))
+
 
 def get_client_ip(request: Request) -> Optional[str]:
     """
-    Extract the real client IP from a request, correctly handling reverse proxies.
-    Priority: X-Forwarded-For (first entry) > X-Real-IP > request.client.host.
-    Behind reverse proxies (e.g. Render, Cloudflare), request.client.host is the
-    proxy's internal IP, not the real client.
+    Extract the real client IP from a request
     """
     forwarded = request.headers.get("X-Forwarded-For", "").strip()
     if forwarded:
@@ -635,6 +636,12 @@ def submit_kernel(
                 status_code=400,
                 detail="tokens_per_sec must be a positive number."
             )
+        if req.tokens_per_sec < MIN_PLAUSIBLE_TPS or req.tokens_per_sec > MAX_PLAUSIBLE_TPS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"tokens_per_sec={req.tokens_per_sec:.2f} is outside plausible range "
+                       f"Rejected as spam."
+            )
 
         network = normalize_network(getattr(req, "network", None))
 
@@ -1055,6 +1062,15 @@ def reveal_submission(
             req.benchmarks
         )
         
+        # Validate TPS bounds before accepting reveal
+        if req.tokens_per_sec is not None and req.tokens_per_sec > 0:
+            if req.tokens_per_sec < MIN_PLAUSIBLE_TPS or req.tokens_per_sec > MAX_PLAUSIBLE_TPS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"tokens_per_sec={req.tokens_per_sec:.2f} is outside plausible range "
+                           f"Rejected as spam."
+                )
+
         # Update submission with revealed data
         submission.fork_url = req.fork_url
         submission.commit_hash = req.commit_hash
@@ -1133,11 +1149,13 @@ def record_verification(
     max_abs_diff: Optional[float] = None,
     throughput: Optional[float] = None,
     reason: Optional[str] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature)
 ):
     """
     Record logit verification result for a submission.
     Called by validator after running logit verification.
+    Requires validator authentication.
     """
     submission = db.query(models.SpeedSubmission).filter(
         models.SpeedSubmission.id == submission_id
@@ -1146,6 +1164,16 @@ def record_verification(
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
     
+    # Validate cosine_similarity range [0.0, 1.0]
+    if cosine_similarity is not None and (cosine_similarity < 0.0 or cosine_similarity > 1.0):
+        raise HTTPException(status_code=400, detail=f"cosine_similarity must be in [0.0, 1.0], got {cosine_similarity}")
+    # Validate max_abs_diff is non-negative
+    if max_abs_diff is not None and max_abs_diff < 0.0:
+        raise HTTPException(status_code=400, detail=f"max_abs_diff must be >= 0, got {max_abs_diff}")
+    # Validate throughput if provided
+    if throughput is not None and (throughput < 0 or throughput > MAX_PLAUSIBLE_TPS):
+        raise HTTPException(status_code=400, detail=f"throughput={throughput} outside plausible range")
+
     # Update verification fields
     submission.logit_verification_passed = verified
     submission.cosine_similarity = cosine_similarity
@@ -1315,14 +1343,25 @@ def get_pending_validations(
     Requires validator authentication. fork_url is never exposed to public endpoints.
     """
     network = normalize_network(network)
-    submissions = (
+
+    # Exclude submissions from flagged miners
+    flagged_hotkeys_q = (
+        db.query(models.MinerRegistration.hotkey)
+        .filter(models.MinerRegistration.is_flagged == True)
+    )
+    flagged_hotkeys = {r.hotkey for r in flagged_hotkeys_q.all()}
+
+    submissions_q = (
         db.query(models.SpeedSubmission)
         .filter(models.SpeedSubmission.network == network)
         .filter(models.SpeedSubmission.validated == False)
         .order_by(models.SpeedSubmission.created_at.desc())
-        .limit(limit)
-        .all()
     )
+    if flagged_hotkeys:
+        submissions_q = submissions_q.filter(
+            ~models.SpeedSubmission.miner_hotkey.in_(flagged_hotkeys)
+        )
+    submissions = submissions_q.limit(limit).all()
 
     return {
         "pending_count": len(submissions),
@@ -1347,11 +1386,13 @@ def get_pending_validations(
 @app.post("/mark_validated")
 def mark_validated(
     req: dict,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature)
 ):
     """
     Mark a submission as validated and record its score.
     Used by validators to avoid re-evaluating the same submission.
+    Requires validator authentication.
     """
     submission_id = req.get("submission_id")
     if not submission_id:
@@ -1363,15 +1404,22 @@ def mark_validated(
 
     submission.validated = True
     
-    # Update score if provided
+    # Update score if provided (clamp to [0.0, 1.0])
     score = req.get("score")
     if score is not None:
-        submission.score = float(score)
+        score = max(0.0, min(1.0, float(score)))
+        submission.score = score
         print(f"📊 [MARK_VALIDATED] Submission {submission_id}: score={score:.4f}")
 
     actual_tps = req.get("actual_tokens_per_sec")
     if actual_tps is not None:
         actual_tps = float(actual_tps)
+        if actual_tps < MIN_PLAUSIBLE_TPS or actual_tps > MAX_PLAUSIBLE_TPS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"actual_tokens_per_sec={actual_tps:.2f} is outside plausible range "
+                       f"Rejected."
+            )
         old_tps = submission.tokens_per_sec
         submission.validated_tokens_per_sec = actual_tps
     
@@ -1482,9 +1530,10 @@ def mark_validated(
 @app.post("/record_failure")
 def record_failure_endpoint(
     req: dict,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature)
 ):
-    """Record a failed submission for IP tracking."""
+    """Record a failed submission for IP tracking. Requires validator authentication."""
     ip_address = req.get("ip_address")
     if ip_address:
         record_failure(ip_address, db)
@@ -1585,12 +1634,11 @@ def register_miner(
 @app.post("/sync_uids")
 def sync_uids(
     req: dict,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature)
 ):
     """
     Bulk-update miner UIDs and coldkeys from the metagraph for a given network.
-    Body: {"network": "finney"|"test", "uid_map": {hotkey: uid}, "coldkey_map": {hotkey: coldkey}}.
-    Called by validators who have access to the metagraph.
     """
     network = normalize_network(req.get("network"))
     uid_map = req.get("uid_map") or req
@@ -1655,9 +1703,11 @@ def sync_uids(
 @app.get("/flagged_miners")
 def get_flagged_miners(
     network: Optional[str] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature)
 ):
-    """List all miners flagged by spam checks."""
+    """List all miners flagged by spam checks. Requires validator authentication.
+    """
     network = normalize_network(network)
     flagged = (
         db.query(models.MinerRegistration)
@@ -1674,9 +1724,6 @@ def get_flagged_miners(
             {
                 "hotkey": r.hotkey,
                 "uid": r.uid,
-                "coldkey": r.coldkey,
-                "github_username": r.github_username,
-                "registration_ip": r.registration_ip,
                 "flag_reason": r.flag_reason,
             }
             for r in flagged
@@ -1687,9 +1734,10 @@ def get_flagged_miners(
 @app.post("/flag_miner")
 def flag_miner(
     req: dict,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature)
 ):
-    """Manually flag or unflag a miner. Body: {"hotkey": str, "network": str, "flag": bool, "reason": str}."""
+    """Manually flag or unflag a miner. Requires validator authentication."""
     hotkey = req.get("hotkey")
     if not hotkey:
         raise HTTPException(status_code=400, detail="hotkey required")
@@ -1981,9 +2029,10 @@ def get_current_round(
 @app.post("/create_round", response_model=models.RoundResponse)
 def create_round(
     req: models.CreateRoundRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature)
 ):
-    """Create a new competition round.
+    """Create a new competition round. Requires validator authentication.
     
     Request body (can send empty {} to use defaults):
     - duration_hours: int (default: 48)
@@ -2099,9 +2148,25 @@ def calculate_rankings(
             models.SpeedSubmission.id == baseline_submission_id
         ).first()
     
+    # Pre-fetch flagged hotkeys so we can exclude them from rankings.
+    # Flagged miners' existing submissions must not win rounds or become baselines.
+    flagged_hotkeys = {
+        r.hotkey
+        for r in db.query(models.MinerRegistration.hotkey).filter(
+            models.MinerRegistration.is_flagged == True
+        ).all()
+    }
+
     # Calculate weighted scores
     ranked_submissions = []
     for sub in submissions:
+        # ═══════════════════════════════════════════════════════════════════════
+        # FLAGGED MINER FILTER
+        # ═══════════════════════════════════════════════════════════════════════
+        if sub.miner_hotkey in flagged_hotkeys:
+            print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Miner is flagged")
+            continue
+
         # ═══════════════════════════════════════════════════════════════════════
         # LOGIT VERIFICATION FILTER (from qllm architecture)
         # Skip submissions that failed logit verification or are not revealed
@@ -2112,13 +2177,13 @@ def calculate_rankings(
             print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Not revealed yet")
             continue
         
-        # Only rank submissions that have passed logit verification ──
-        # Require explicit True (not None/pending) to prevent unvalidated spam from ranking.
-        if sub.logit_verification_passed != True:
-            if sub.logit_verification_passed == False:
-                print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Failed logit verification")
-            else:
-                print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Logit verification pending (not validated yet)")
+        # Exclude submissions that explicitly FAILED logit verification.
+        # Submissions with logit_verification_passed=None are allowed (verification
+        # not applicable, e.g. fork_url submissions without docker_image).
+        # Spam is already prevented by requiring validated_tokens_per_sec (validator
+        # actually ran benchmarks) and the commit-reveal mechanism.
+        if sub.logit_verification_passed == False:
+            print(f"[RANKING] Skipping {sub.miner_hotkey[:8]}...: Failed logit verification")
             continue
         
         # ── ANTI-SPAM: Only use validator-measured TPS ──
@@ -2216,10 +2281,10 @@ def get_submission_rate(
     }
 
 @app.post("/finalize_round/{round_id}")
-def finalize_round(round_id: int, db: Session = Depends(get_db)):
+def finalize_round(round_id: int, db: Session = Depends(get_db), hotkey: str = Depends(auth.verify_validator_signature)):
     """
     Finalize a round: evaluate all submissions and determine winners.
-    Called at round deadline.
+    Called at round deadline. Requires validator authentication.
     """
     round_obj = db.query(models.CompetitionRound).filter(
         models.CompetitionRound.id == round_id
@@ -2346,153 +2411,11 @@ def get_completed_rounds(
     }
 
 @app.post("/refinalize_round/{round_id}")
-def refinalize_round(round_id: int, db: Session = Depends(get_db)):
+def refinalize_round(round_id: int, db: Session = Depends(get_db), hotkey: str = Depends(auth.verify_validator_signature)):
     """
     Re-finalize a completed round that doesn't have a winner_hotkey set.
     Useful if a round was completed but winner wasn't set due to timing issues.
-    """
-    round_obj = db.query(models.CompetitionRound).filter(
-        models.CompetitionRound.id == round_id
-    ).first()
-    
-    if not round_obj:
-        raise HTTPException(status_code=404, detail="Round not found")
-    
-    if round_obj.status != "completed":
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Round is not completed (status: {round_obj.status}). Only completed rounds can be re-finalized."
-        )
-    
-    if round_obj.winner_hotkey:
-        return {
-            "status": "already_has_winner",
-            "round_id": round_id,
-            "winner_hotkey": round_obj.winner_hotkey,
-            "message": "Round already has a winner. No need to re-finalize."
-        }
-    
-    # Get all validated submissions for this round
-    submissions = (
-        db.query(models.SpeedSubmission)
-        .filter(models.SpeedSubmission.round_id == round_id)
-        .filter(models.SpeedSubmission.validated == True)
-        .all()
-    )
-    
-    if not submissions:
-        return {
-            "status": "no_submissions",
-            "round_id": round_id,
-            "message": "No validated submissions found in this round."
-        }
-    
-    # Calculate rankings
-    rankings = calculate_rankings(submissions, round_obj.baseline_submission_id, db)
-    
-    if not rankings:
-        # Check why rankings are empty
-        total_submissions = len(submissions)
-        revealed_count = sum(1 for s in submissions if s.is_revealed == True)
-        verified_count = sum(1 for s in submissions if s.logit_verification_passed == True)
-        validated_tps_count = sum(1 for s in submissions if s.validated_tokens_per_sec is not None)
-        
-        return {
-            "status": "no_valid_rankings",
-            "round_id": round_id,
-            "message": "No submissions passed all ranking filters.",
-            "diagnostics": {
-                "total_validated_submissions": total_submissions,
-                "revealed_submissions": revealed_count,
-                "passed_logit_verification": verified_count,
-                "have_validated_tokens_per_sec": validated_tps_count
-            }
-        }
-    
-    # Set winner
-    winner = rankings[0]
-    round_obj.winner_hotkey = winner["miner_hotkey"]
-    round_obj.baseline_submission_id = winner["submission_id"]
-    db.commit()
-    
-    # Mark winning submission as baseline for next round
-    winner_submission = db.query(models.SpeedSubmission).filter(
-        models.SpeedSubmission.id == winner["submission_id"]
-    ).first()
-    if winner_submission:
-        winner_submission.is_baseline = True
-        db.commit()
-    
-    print(f"✅ [REFINALIZE] Round {round_id} winner set: {round_obj.winner_hotkey}")
-    
-    return {
-        "status": "success",
-        "round_id": round_id,
-        "winner_hotkey": round_obj.winner_hotkey,
-        "rankings": rankings[:4]  # Top 4
-    }
-
-@app.get("/get_completed_rounds")
-def get_completed_rounds(
-    network: Optional[str] = None,
-    limit: int = 10,
-    db: Session = Depends(get_db)
-):
-    """
-    Get list of completed rounds with their winners.
-    Useful for viewing round history and checking if winners were set.
-    """
-    network = normalize_network(network)
-    
-    rounds = (
-        db.query(models.CompetitionRound)
-        .filter(models.CompetitionRound.network == network)
-        .filter(models.CompetitionRound.status == "completed")
-        .order_by(models.CompetitionRound.round_number.desc())
-        .limit(limit)
-        .all()
-    )
-    
-    result = []
-    for round_obj in rounds:
-        # Count submissions
-        submission_count = (
-            db.query(models.SpeedSubmission)
-            .filter(models.SpeedSubmission.round_id == round_obj.id)
-            .count()
-        )
-        
-        validated_count = (
-            db.query(models.SpeedSubmission)
-            .filter(models.SpeedSubmission.round_id == round_obj.id)
-            .filter(models.SpeedSubmission.validated == True)
-            .count()
-        )
-        
-        result.append({
-            "round_id": round_obj.id,
-            "round_number": round_obj.round_number,
-            "start_time": round_obj.start_time.isoformat() if isinstance(round_obj.start_time, datetime) else str(round_obj.start_time),
-            "end_time": round_obj.end_time.isoformat() if isinstance(round_obj.end_time, datetime) else str(round_obj.end_time),
-            "status": round_obj.status,
-            "winner_hotkey": round_obj.winner_hotkey,
-            "baseline_submission_id": round_obj.baseline_submission_id,
-            "total_submissions": submission_count,
-            "validated_submissions": validated_count,
-            "has_winner": round_obj.winner_hotkey is not None
-        })
-    
-    return {
-        "network": network,
-        "completed_rounds": result,
-        "total": len(result)
-    }
-
-@app.post("/refinalize_round/{round_id}")
-def refinalize_round(round_id: int, db: Session = Depends(get_db)):
-    """
-    Re-finalize a completed round that doesn't have a winner_hotkey set.
-    Useful if a round was completed but winner wasn't set due to timing issues.
+    Requires validator authentication.
     """
     round_obj = db.query(models.CompetitionRound).filter(
         models.CompetitionRound.id == round_id
