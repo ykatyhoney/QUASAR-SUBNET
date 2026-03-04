@@ -510,7 +510,7 @@ except Exception as e:
 app = FastAPI(title="Quasar Validator API")
 
 _cors_origins_raw = os.environ.get("CORS_ALLOWED_ORIGINS", "").strip()
-CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()] if _cors_origins_raw else ["*"]
+CORS_ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in _cors_origins_raw.split(",") if o.strip()] if _cors_origins_raw else ["*"]
 
 app.add_middleware(
     CORSMiddleware,
