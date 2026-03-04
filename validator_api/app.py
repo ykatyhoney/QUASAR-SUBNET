@@ -911,7 +911,54 @@ def commit_submission(
         is_banned, ban_reason = check_ip_ban(client_ip, db)
         if is_banned:
             raise HTTPException(status_code=403, detail=f"IP address banned: {ban_reason}")
-        
+
+        if miner_reg and miner_reg.is_flagged:
+            print(f"🚫 [COMMIT] Flagged miner {hotkey[:12]}... reason: {miner_reg.flag_reason}")
+            raise HTTPException(status_code=403, detail=f"Miner flagged: {miner_reg.flag_reason or 'anti-spam'}")
+
+        SUBMISSION_COOLDOWN_SECONDS = int(os.environ.get("SUBMISSION_COOLDOWN_SECONDS", "300"))
+        recent_submission = (
+            db.query(models.SpeedSubmission)
+            .filter(
+                models.SpeedSubmission.miner_hotkey == hotkey,
+                models.SpeedSubmission.network == network,
+                models.SpeedSubmission.created_at >= datetime.utcnow() - timedelta(seconds=SUBMISSION_COOLDOWN_SECONDS)
+            )
+            .order_by(models.SpeedSubmission.created_at.desc())
+            .first()
+        )
+        if recent_submission:
+            seconds_ago = (datetime.utcnow() - recent_submission.created_at).total_seconds()
+            remaining = SUBMISSION_COOLDOWN_SECONDS - seconds_ago
+            print(f"🚫 [COMMIT] Rate limit: {hotkey[:12]}... submitted {seconds_ago:.0f}s ago (cooldown: {SUBMISSION_COOLDOWN_SECONDS}s)")
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Please wait {remaining:.0f} seconds before submitting again. "
+                       f"Maximum 1 submission per {SUBMISSION_COOLDOWN_SECONDS // 60} minutes."
+            )
+
+        # coldkey dedup
+        if miner_reg and miner_reg.coldkey:
+            other_coldkey_reg = (
+                db.query(models.MinerRegistration)
+                .filter(
+                    models.MinerRegistration.coldkey == miner_reg.coldkey,
+                    models.MinerRegistration.network == network,
+                    models.MinerRegistration.hotkey != hotkey,
+                )
+                .first()
+            )
+            if other_coldkey_reg:
+                print(f"🚫 [COMMIT] Coldkey {miner_reg.coldkey[:12]}... already used by {other_coldkey_reg.hotkey[:12]}...")
+                if not miner_reg.is_flagged:
+                    miner_reg.is_flagged = True
+                    miner_reg.flag_reason = f"Duplicate coldkey (original: {other_coldkey_reg.hotkey[:12]}...)"
+                    db.commit()
+                raise HTTPException(
+                    status_code=403,
+                    detail="This coldkey already has a registered hotkey. One hotkey per coldkey."
+                )
+
         # Check for duplicate commitment hash
         existing = db.query(models.SpeedSubmission).filter(
             models.SpeedSubmission.commitment_hash == req.commitment_hash
@@ -1111,7 +1158,8 @@ def reveal_submission(
 
 @app.get("/pending_reveals")
 def get_pending_reveals(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature),
 ):
     """
     Get submissions that are pending reveal (commitment made but not yet revealed).
@@ -1141,7 +1189,7 @@ def get_pending_reveals(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════
-# LOGIT VERIFICATION ENDPOINTS (from const's qllm architecture)
+# LOGIT VERIFICATION ENDPOINTS (from qllm architecture)
 # Verifies miners are running the actual model, not returning bogus values
 # ═══════════════════════════════════════════════════════════════════════════════════
 
@@ -1202,7 +1250,8 @@ def record_verification(
 @app.get("/verification_stats")
 def get_verification_stats(
     round_id: Optional[int] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature),
 ):
     """
     Get verification statistics for submissions.
@@ -1245,7 +1294,8 @@ def get_verification_stats(
 @app.get("/get_submission_stats")
 def get_submission_stats(
     limit: int = 50,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature),
 ):
     limit = min(limit, 200)
     """
@@ -1565,7 +1615,33 @@ def register_miner(
             detail=f"Invalid league. Must be one of: {', '.join(LEAGUES)}"
         )
 
+    MAX_MODEL_NAME_LENGTH = 128
+    if not req.model_name or not req.model_name.strip():
+        raise HTTPException(status_code=400, detail="model_name is required")
+    if len(req.model_name) > MAX_MODEL_NAME_LENGTH:
+        raise HTTPException(status_code=400, detail=f"model_name too long (max {MAX_MODEL_NAME_LENGTH} chars)")
+
     network = normalize_network(getattr(req, "network", None))
+
+    # Anti-spam: flagged miner check
+    miner_reg = db.query(models.MinerRegistration).filter(
+        models.MinerRegistration.hotkey == hotkey,
+        models.MinerRegistration.network == network,
+    ).first()
+    if miner_reg and miner_reg.is_flagged:
+        raise HTTPException(status_code=403, detail=f"Miner flagged: {miner_reg.flag_reason or 'anti-spam'}")
+
+    # Anti-spam: cap registrations per hotkey to prevent DB flooding
+    MAX_REGISTRATIONS_PER_MINER = len(LEAGUES) * 5
+    reg_count = db.query(models.MinerScore).filter(
+        models.MinerScore.hotkey == hotkey,
+        models.MinerScore.network == network,
+    ).count()
+    if reg_count >= MAX_REGISTRATIONS_PER_MINER:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Registration limit reached ({MAX_REGISTRATIONS_PER_MINER} per miner). Cannot register more model/league combinations."
+        )
 
     # Check if already registered for this (hotkey, model, league, network) combo
     existing = db.query(models.MinerScore).filter(
@@ -1791,7 +1867,8 @@ def get_weights(
     round_id: Optional[int] = None,
     network: Optional[str] = None,
     completed_only: bool = True,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature),
 ):
     """
     Get weights for top 4 performers in a specific round for the given network.
@@ -2008,7 +2085,8 @@ def ensure_current_round(db, network: Optional[str] = None):
 @app.get("/get_current_round", response_model=models.RoundResponse)
 def get_current_round(
     network: Optional[str] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature),
 ):
     """Get the current active round for the given network. Expires finished rounds and creates a new one if needed."""
     try:
@@ -2272,7 +2350,8 @@ def calculate_rankings(
 @app.get("/get_submission_rate")
 def get_submission_rate(
     window_minutes: int = 10,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature),
 ):
     """
     Get current submission rate (submissions per minute).
@@ -2379,7 +2458,8 @@ def finalize_round(round_id: int, db: Session = Depends(get_db), hotkey: str = D
 def get_completed_rounds(
     network: Optional[str] = None,
     limit: int = 10,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature),
 ):
     """
     Get list of completed rounds with their winners.

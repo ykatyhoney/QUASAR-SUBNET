@@ -1357,6 +1357,7 @@ class Validator(BaseValidatorNeuron):
                 response = requests.get(
                     f"{VALIDATOR_API_URL}/get_submission_rate",
                     params={"window_minutes": 10},
+                    headers=self._api_auth_headers(),
                     timeout=10
                 )
                 if response.status_code == 200:
@@ -1439,6 +1440,7 @@ class Validator(BaseValidatorNeuron):
                 response = requests.get(
                     f"{VALIDATOR_API_URL}/get_current_round",
                     params={"network": network},
+                    headers=self._api_auth_headers(),
                     timeout=15
                 )
                 if response.status_code == 200:
@@ -1467,6 +1469,7 @@ class Validator(BaseValidatorNeuron):
                 response = requests.get(
                     f"{VALIDATOR_API_URL}/get_weights",
                     params={"network": network},
+                    headers=self._api_auth_headers(),
                     timeout=10
                 )
                 if response.status_code == 200:
