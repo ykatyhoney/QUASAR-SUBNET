@@ -2635,14 +2635,15 @@ def dashboard_leaderboard(
     if not round_obj:
         return {"round": None, "leaderboard": []}
 
-    submissions = (
+    all_submissions = (
         db.query(models.SpeedSubmission)
         .filter(models.SpeedSubmission.round_id == round_obj.id)
         .filter(models.SpeedSubmission.validated == True)
         .all()
     )
 
-    rankings = calculate_rankings(submissions, round_obj.baseline_submission_id, db)
+    rankings = calculate_rankings(all_submissions, round_obj.baseline_submission_id, db)
+    ranked_hotkeys = {entry["miner_hotkey"] for entry in rankings}
 
     leaderboard = []
     for entry in rankings[:20]:
@@ -2653,8 +2654,30 @@ def dashboard_leaderboard(
             "target_sequence_length": entry["target_sequence_length"],
             "league": entry["league"],
             "weighted_score": entry["weighted_score"],
-            "logit_verified": entry.get("logit_verification_passed"),
+            "logit_verification_passed": True,
             "cosine_similarity": entry.get("cosine_similarity"),
+        })
+
+    best_by_hotkey: dict = {}
+    for sub in all_submissions:
+        if sub.miner_hotkey in ranked_hotkeys:
+            continue
+        prev = best_by_hotkey.get(sub.miner_hotkey)
+        if prev is None or (sub.validated_tokens_per_sec or 0) > (prev.validated_tokens_per_sec or 0):
+            best_by_hotkey[sub.miner_hotkey] = sub
+
+    for sub in sorted(best_by_hotkey.values(),
+                      key=lambda s: (s.validated_tokens_per_sec or 0), reverse=True):
+        league = get_league_for_seq_len(sub.target_sequence_length)
+        leaderboard.append({
+            "rank": None,
+            "miner_hotkey": sub.miner_hotkey,
+            "tokens_per_sec": sub.validated_tokens_per_sec or sub.tokens_per_sec,
+            "target_sequence_length": sub.target_sequence_length,
+            "league": league,
+            "weighted_score": None,
+            "logit_verification_passed": sub.logit_verification_passed,
+            "cosine_similarity": sub.cosine_similarity,
         })
 
     return {
@@ -2667,6 +2690,79 @@ def dashboard_leaderboard(
             "end_time": round_obj.end_time.isoformat(),
         },
         "leaderboard": leaderboard,
+    }
+
+
+@app.get("/dashboard/top_miners")
+def dashboard_top_miners(
+    network: Optional[str] = None,
+    db: Session = Depends(get_db),
+    role: str = Depends(auth.verify_dashboard_read),
+):
+    """Return top 4 miners from the last completed round."""
+    network = normalize_network(network)
+
+    round_obj = (
+        db.query(models.CompetitionRound)
+        .filter(
+            models.CompetitionRound.network == network,
+            models.CompetitionRound.status == "completed",
+        )
+        .order_by(models.CompetitionRound.round_number.desc())
+        .first()
+    )
+
+    if not round_obj:
+        return {"round": None, "top_miners": []}
+
+    submissions = (
+        db.query(models.SpeedSubmission)
+        .filter(
+            models.SpeedSubmission.round_id == round_obj.id,
+            models.SpeedSubmission.validated == True,
+        )
+        .all()
+    )
+
+    rankings = calculate_rankings(submissions, round_obj.baseline_submission_id, db)
+
+    top_miners = []
+    for entry in rankings[:TOP_N_MINERS]:
+        reg = db.query(models.MinerRegistration).filter(
+            models.MinerRegistration.hotkey == entry["miner_hotkey"],
+            models.MinerRegistration.network == network,
+        ).first()
+
+        sub = db.query(models.SpeedSubmission).filter(
+            models.SpeedSubmission.id == entry["submission_id"]
+        ).first()
+
+        top_miners.append({
+            "rank": entry["rank"],
+            "miner_hotkey": entry["miner_hotkey"],
+            "uid": reg.uid if reg else None,
+            "tokens_per_sec": entry["tokens_per_sec"],
+            "target_sequence_length": entry["target_sequence_length"],
+            "league": entry["league"],
+            "weighted_score": entry["weighted_score"],
+            "reward_percent": REWARD_DISTRIBUTION[entry["rank"] - 1] * 100 if entry["rank"] <= len(REWARD_DISTRIBUTION) else 0,
+            "logit_verification_passed": entry.get("logit_verification_passed"),
+            "cosine_similarity": entry.get("cosine_similarity"),
+            "github_username": _github_username_from_fork_url(sub.fork_url) if sub else None,
+            "fork_url": sub.fork_url if sub else None,
+            "submitted_at": sub.created_at.isoformat() if sub else None,
+        })
+
+    return {
+        "round": {
+            "round_id": round_obj.id,
+            "round_number": round_obj.round_number,
+            "status": round_obj.status,
+            "winner_hotkey": round_obj.winner_hotkey,
+            "start_time": round_obj.start_time.isoformat(),
+            "end_time": round_obj.end_time.isoformat(),
+        },
+        "top_miners": top_miners,
     }
 
 
