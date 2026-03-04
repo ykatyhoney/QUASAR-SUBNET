@@ -2719,6 +2719,7 @@ def dashboard_miner_detail(
         "network": network,
         "is_flagged": reg.is_flagged,
         "flag_reason": reg.flag_reason if reg.is_flagged else None,
-        "registered_at": reg.created_at.isoformat() if reg.created_at else None,
+        "registered_at": reg.registered_at,
+        "last_seen": reg.last_seen,
         "recent_submissions": submissions_data,
     }
