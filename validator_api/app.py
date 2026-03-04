@@ -1704,9 +1704,24 @@ def sync_uids(
     if new_regs:
         db.bulk_save_objects(new_regs)
     
+    stale_count = (
+        db.query(models.MinerRegistration)
+        .filter(
+            models.MinerRegistration.network == network,
+            ~models.MinerRegistration.hotkey.in_(hotkeys_list),
+        )
+        .delete(synchronize_session="fetch")
+    )
+    if stale_count > 0:
+        print(f"[SYNC_UIDS] Removed {stale_count} deregistered miners from {network}")
+    
     db.commit()
-    print(f"[SYNC_UIDS] Synced {updated} UIDs for network={network} ({len(new_regs)} new, {updated - len(new_regs)} updated)")
-    return {"status": "ok", "updated": updated, "total_entries": len(uid_map), "network": network}
+    print(f"[SYNC_UIDS] Synced {updated} UIDs for network={network} "
+          f"({len(new_regs)} new, {updated - len(new_regs)} updated, {stale_count} removed)")
+    return {
+        "status": "ok", "updated": updated, "removed": stale_count,
+        "total_entries": len(uid_map), "network": network,
+    }
 
 
 @app.get("/flagged_miners")
