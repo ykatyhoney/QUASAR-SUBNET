@@ -5,7 +5,7 @@
 # Miner Inference Server for QUASAR Inference Verification Subnet
 #
 # This server exposes the required inference interface for validators:
-#   inference(prompt, gen_len, logits_at_step) → {tokens, captured_logits, elapsed_sec}
+#   inference(prompt, gen_len, logits_at_steps) → {tokens, captured_logits_multi, elapsed_sec}
 
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -18,20 +18,22 @@
 ║  POST /inference                                                             ║
 ║  Request:                                                                    ║
 ║    {                                                                         ║
-║      "prompt": [token_ids...],      // List of input token IDs               ║
-║      "gen_len": int,                 // Number of tokens to generate         ║
-║      "logits_at_step": int           // Step to capture logits (1-indexed)   ║
+║      "prompt": [token_ids...],           // List of input token IDs          ║
+║      "gen_len": int,                     // Number of tokens to generate     ║
+║      "logits_at_step": int,              // Legacy single step (1-indexed)   ║
+║      "logits_at_steps": [int, int, ...]  // Multi-step capture (1-indexed)   ║
 ║    }                                                                         ║
 ║                                                                              ║
 ║  Response:                                                                   ║
 ║    {                                                                         ║
-║      "tokens": [generated_ids...],   // Generated token IDs                  ║
-║      "captured_logits": [floats...], // Logits at logits_at_step             ║
-║      "elapsed_sec": float            // Time taken for inference             ║
+║      "tokens": [generated_ids...],                                           ║
+║      "captured_logits": [floats...],              // Legacy (first step)     ║
+║      "captured_logits_multi": {step: [floats]},   // All requested steps     ║
+║      "elapsed_sec": float                                                    ║
 ║    }                                                                         ║
 ║                                                                              ║
-║  The captured_logits are compared against the reference model (Qwen2.5-0.5B) ║
-║  using cosine similarity + max absolute difference for verification.         ║
+║  Validators compare captured_logits_multi against a reference model using    ║
+║  cosine similarity + max absolute difference for verification.               ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
@@ -42,7 +44,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
 
 
@@ -127,16 +129,18 @@ async def lifespan(app: FastAPI):
 
 class InferenceRequest(BaseModel):
     """Request model for inference endpoint."""
-    prompt: List[int]  # Input token IDs
-    gen_len: int  # Number of tokens to generate
-    logits_at_step: int  # Step to capture logits (1-indexed)
+    prompt: List[int]
+    gen_len: int
+    logits_at_step: int  # Legacy single-step capture (1-indexed)
+    logits_at_steps: Optional[List[int]] = None  # Multi-step capture (1-indexed)
 
 
 class InferenceResponse(BaseModel):
     """Response model for inference endpoint."""
-    tokens: List[int]  # Generated token IDs
-    captured_logits: Optional[List[float]]  # Logits at the specified step
-    elapsed_sec: float  # Time taken for inference
+    tokens: List[int]
+    captured_logits: Optional[List[float]] = None  # Legacy: logits at first captured step
+    captured_logits_multi: Optional[Dict[int, List[float]]] = None  # All captured steps
+    elapsed_sec: float
 
 
 class HealthResponse(BaseModel):
@@ -185,29 +189,31 @@ async def inference(request: InferenceRequest):
         device = next(model.parameters()).device
         input_ids = torch.tensor([request.prompt], device=device)
         
+        capture_set = set(request.logits_at_steps or [request.logits_at_step])
+
         generated_tokens = []
         captured_logits = None
+        captured_logits_multi: Dict[int, List[float]] = {}
         past_key_values = None
         
         start_time = time.perf_counter()
         
         with torch.no_grad():
-            # Initial forward pass (prefill)
             outputs = model(input_ids, use_cache=True)
             past_key_values = outputs.past_key_values
             next_token_logits = outputs.logits[:, -1, :]
             
-            # Autoregressive generation
             for step in range(request.gen_len):
-                # Capture logits at the specified step (1-indexed)
-                if step + 1 == request.logits_at_step:
-                    captured_logits = next_token_logits[0].cpu().float().tolist()
+                step_1indexed = step + 1
+                if step_1indexed in capture_set:
+                    logits_list = next_token_logits[0].cpu().float().tolist()
+                    captured_logits_multi[step_1indexed] = logits_list
+                    if captured_logits is None:
+                        captured_logits = logits_list
                 
-                # Greedy decoding (argmax)
                 next_token = next_token_logits.argmax(dim=-1)
                 generated_tokens.append(next_token.item())
                 
-                # Forward pass with KV cache
                 outputs = model(
                     next_token.unsqueeze(0),
                     past_key_values=past_key_values,
@@ -221,6 +227,7 @@ async def inference(request: InferenceRequest):
         return InferenceResponse(
             tokens=generated_tokens,
             captured_logits=captured_logits,
+            captured_logits_multi=captured_logits_multi,
             elapsed_sec=elapsed_sec
         )
         
