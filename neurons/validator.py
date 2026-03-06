@@ -276,23 +276,25 @@ class PerformanceValidator:
                 timeout=60,
             )
 
-    def run_performance_test(self, repo_path: str, sequence_length: int) -> Dict[str, float]:
-        """Run performance test on cloned repository.
+    # Docker image used to sandbox miner code execution.
+    # Must have Python, PyTorch, Triton, and fla base dependencies installed.
+    SANDBOX_IMAGE = os.getenv(
+        "VALIDATOR_SANDBOX_IMAGE",
+        "quasar-miner-gpu:latest",
+    )
+    # Hard resource limits for the sandbox container.
+    SANDBOX_MEMORY_LIMIT = os.getenv("SANDBOX_MEMORY_LIMIT", "16g")
+    try:
+        SANDBOX_TIMEOUT = int(os.getenv("SANDBOX_TIMEOUT", "300"))
+    except (TypeError, ValueError):
+        SANDBOX_TIMEOUT = 300
 
-        Returns:
-            Dict with keys: tokens_per_sec, vram_mb
-        """
-        print(f"[VALIDATOR] Running performance test (seq_len={sequence_length})...")
-        
-        # Create temporary test script with target sequence length
-        temp_test_script = os.path.join(repo_path, f"test_temp_{sequence_length}.py")
-        with open(temp_test_script, 'w') as f:
-            f.write(f"""
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    def _build_test_script(self, sequence_length: int) -> str:
+        """Return the Python source for the benchmark test script."""
+        return f"""
+import sys, os, time, json
+sys.path.insert(0, "/workspace")
 
-# Enable verbose logging for Triton kernel compilation
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 os.environ["TRITON_PRINT_DEBUG"] = "1"
 
@@ -301,13 +303,12 @@ from fla.layers.quasar import QuasarAttention
 
 def test_quasar():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     batch_size = 1
     seq_len = {sequence_length}
     hidden_size = 512
     head_dim = 64
     num_heads = 8
-    
+
     quasar = QuasarAttention(
         hidden_size=hidden_size,
         head_dim=head_dim,
@@ -315,32 +316,25 @@ def test_quasar():
         mode="chunk",
         use_short_conv=True,
     ).to(device)
-    
+
     x = torch.randn(batch_size, seq_len, hidden_size, device=device)
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
-    
-    # Warmup
+
     for _ in range(3):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else torch.no_grad():
             _ = quasar(x)
-    
     if device.type == "cuda":
         torch.cuda.synchronize()
-    
-    # Benchmark
-    import time
+
     num_runs = 10
     start = time.time()
-    
     for _ in range(num_runs):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else torch.no_grad():
             _ = quasar(x)
-    
     if device.type == "cuda":
         torch.cuda.synchronize()
-    
     elapsed = time.time() - start
     tokens_per_sec = (batch_size * seq_len * num_runs) / elapsed
 
@@ -348,52 +342,180 @@ def test_quasar():
     if device.type == "cuda":
         vram_bytes = torch.cuda.max_memory_allocated()
     vram_mb = vram_bytes / (1024 * 1024)
-    
+
     print(f"RESULT: {{tokens_per_sec:.2f}}")
     print(f"VRAM_MB: {{vram_mb:.2f}}")
-    return tokens_per_sec
 
 if __name__ == "__main__":
-    tps = test_quasar()
-    print(f"Tokens/sec: {{tps:.2f}}")
-""")
-        
+    test_quasar()
+"""
+
+    def run_performance_test(
+        self, repo_path: str, sequence_length: int
+    ) -> Dict[str, float]:
+        """Run performance test inside a sandboxed Docker container.
+
+        The miner's cloned repo is mounted **read-only** into the container.
+        The container runs with:
+          - --network none   (no network access)
+          - --cap-drop ALL   (drop all Linux capabilities)
+          - --read-only      (read-only root filesystem)
+          - --security-opt no-new-privileges
+          - bounded memory and timeout
+
+        Returns:
+            Dict with keys: tokens_per_sec, vram_mb
+        """
+        print(
+            f"[VALIDATOR] Running sandboxed performance test "
+            f"(seq_len={sequence_length})..."
+        )
+
+        # Write the test script into the repo dir (it will be mounted r/o
+        # inside the container, so we write it on the host side first).
+        test_script_name = f"test_temp_{sequence_length}.py"
+        temp_test_script = os.path.join(repo_path, test_script_name)
+
         try:
-            result = subprocess.run(
-                [sys.executable, temp_test_script],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
-            
-            output = result.stdout + result.stderr
-            
-            tokens_per_sec = 0.0
-            vram_mb = 0.0
-            for line in output.split('\n'):
-                if "RESULT:" in line:
-                    tokens_per_sec = float(line.split("RESULT:")[1].strip())
-                if "VRAM_MB:" in line:
-                    vram_mb = float(line.split("VRAM_MB:")[1].strip())
-            
-            if tokens_per_sec > 0:
-                print(f"[VALIDATOR] Test result: {tokens_per_sec:.2f} tokens/sec | VRAM: {vram_mb:.2f} MB")
-                return {"tokens_per_sec": tokens_per_sec, "vram_mb": vram_mb}
-            
-            print(f"[VALIDATOR] Could not parse test results: {output}")
-            return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
-            
-        except subprocess.TimeoutExpired:
-            print(f"[VALIDATOR] Test timed out (300s)")
-            return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+            with open(temp_test_script, "w") as f:
+                f.write(self._build_test_script(sequence_length))
+
+            # --- Docker SDK sandbox execution --------------------------------
+            try:
+                import docker as _docker
+            except ImportError:
+                return self._run_performance_fallback(
+                    repo_path, temp_test_script
+                )
+
+            client = _docker.from_env()
+
+            run_kwargs = {
+                "image": self.SANDBOX_IMAGE,
+                "command": [
+                    "python", f"/workspace/{test_script_name}"
+                ],
+                "detach": True,
+                "auto_remove": False,
+                # Mount miner repo read-only
+                "volumes": {
+                    os.path.abspath(repo_path): {
+                        "bind": "/workspace",
+                        "mode": "ro",
+                    }
+                },
+                # --- Security hardening ---
+                "network_mode": "none",
+                "cap_drop": ["ALL"],
+                "read_only": True,
+                "security_opt": ["no-new-privileges"],
+                "mem_limit": self.SANDBOX_MEMORY_LIMIT,
+                "pids_limit": 512,
+                # Writable dirs -- Triton compiles .so kernels at runtime
+                # so /tmp and the cache dir must allow execution.
+                "tmpfs": {
+                    "/tmp": "size=2G",
+                    "/root/.triton": "size=1G",
+                },
+                "environment": {
+                    "TRITON_CACHE_DIR": "/root/.triton",
+                },
+                "labels": {"quasar.role": "perf-sandbox"},
+            }
+
+            # GPU is required for meaningful benchmarks.
+            try:
+                run_kwargs["device_requests"] = [
+                    _docker.types.DeviceRequest(
+                        count=1, capabilities=[["gpu"]]
+                    )
+                ]
+            except Exception as gpu_err:
+                print(
+                    f"[VALIDATOR] CRITICAL: Cannot configure GPU for "
+                    f"sandbox container: {gpu_err}. "
+                    f"CPU-only benchmarks are not comparable -- aborting."
+                )
+                return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+
+            container = None
+            try:
+                container = client.containers.run(**run_kwargs)
+                result = container.wait(timeout=self.SANDBOX_TIMEOUT)
+                output = container.logs().decode(errors="replace")
+            except Exception as e:
+                print(f"[VALIDATOR] Sandbox container error: {e}")
+                return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+            finally:
+                if container is not None:
+                    try:
+                        container.stop(timeout=5)
+                    except Exception:
+                        pass
+                    try:
+                        container.remove(force=True)
+                    except Exception:
+                        pass
+
+            return self._parse_test_output(output)
+
         except Exception as e:
             print(f"[VALIDATOR] Test failed: {e}")
             return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
         finally:
-            # Clean up temp test script
             if os.path.exists(temp_test_script):
                 os.remove(temp_test_script)
+
+    @staticmethod
+    def _run_performance_fallback(
+        repo_path: str, test_script: str
+    ) -> Dict[str, float]:
+        """Refuse to run when Docker is unavailable.
+
+        Running miner-controlled code without a container sandbox exposes
+        the validator to RCE.  Return zero so the submission is scored as
+        invalid rather than risk host compromise.
+        """
+        print(
+            "[VALIDATOR] CRITICAL: Docker SDK not available. "
+            "Refusing to execute miner code without sandbox. "
+            "Install the 'docker' Python package and ensure Docker "
+            "daemon is running."
+        )
+        return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+
+    @staticmethod
+    def _parse_test_output(output: str) -> Dict[str, float]:
+        """Parse RESULT: / VRAM_MB: lines from test script stdout."""
+        tokens_per_sec = 0.0
+        vram_mb = 0.0
+        for line in output.split("\n"):
+            if "RESULT:" in line:
+                try:
+                    tokens_per_sec = float(
+                        line.split("RESULT:")[1].strip()
+                    )
+                except ValueError:
+                    pass
+            if "VRAM_MB:" in line:
+                try:
+                    vram_mb = float(
+                        line.split("VRAM_MB:")[1].strip()
+                    )
+                except ValueError:
+                    pass
+
+        if tokens_per_sec > 0:
+            print(
+                f"[VALIDATOR] Test result: {tokens_per_sec:.2f} "
+                f"tokens/sec | VRAM: {vram_mb:.2f} MB"
+            )
+        else:
+            print(
+                f"[VALIDATOR] Could not parse test results from output "
+                f"({len(output)} bytes)"
+            )
+        return {"tokens_per_sec": tokens_per_sec, "vram_mb": vram_mb}
     
     def verify_performance(self, claimed: float, actual: float, tolerance: float = 0.1) -> bool:
         """Verify if actual performance is close to claimed performance."""
