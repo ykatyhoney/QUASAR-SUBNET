@@ -437,7 +437,7 @@ if __name__ == "__main__":
             run_kwargs = {
                 "image": self.SANDBOX_IMAGE,
                 "command": [
-                    "python", f"/workspace/{test_script_name}"
+                    "python3", f"/workspace/{test_script_name}"
                 ],
                 "detach": True,
                 "auto_remove": False,
