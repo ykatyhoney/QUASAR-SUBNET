@@ -439,11 +439,12 @@ def run_container_inference(
 
     Lifecycle:
         1. Pull the image (if not cached locally).
-        2. Start a container mapping an ephemeral host port to 8000.
-        3. Wait for /health to report "healthy".
-        4. POST /inference with the challenge payload.
-        5. Parse the response into a ContainerInferenceResult.
-        6. Always stop and remove the container in the finally block.
+        2. Create / reuse an internal Docker network (no internet access).
+        3. Start a hardened container (read-only, cap-drop ALL, pids limit).
+        4. Wait for /health to report "healthy".
+        5. POST /inference with the challenge payload.
+        6. Parse the response into a ContainerInferenceResult.
+        7. Always stop and remove the container in the finally block.
 
     The miner container must expose a FastAPI server on port 8000 with:
         POST /inference  -> {tokens, captured_logits_multi: {step: logits}, elapsed_sec}
@@ -484,12 +485,27 @@ def run_container_inference(
                 success=False, error=f"docker pull failed: {e}"
             )
 
-        # 2. Start container
+        # 2. Create / reuse an internal Docker network.
+        #    "internal=True" blocks all outbound internet access while
+        #    still allowing the validator to reach the container via the
+        #    mapped port on the host.
+        _INTERNAL_NET_NAME = "quasar-verify-internal"
+        try:
+            verify_network = client.networks.get(_INTERNAL_NET_NAME)
+        except _docker.errors.NotFound:
+            verify_network = client.networks.create(
+                _INTERNAL_NET_NAME,
+                driver="bridge",
+                internal=True,
+            )
+            log(f"Created internal Docker network: {_INTERNAL_NET_NAME}", "info")
+
+        # 3. Start container with security hardening
         run_kwargs: Dict[str, Any] = {
             "image": docker_image,
             "detach": True,
             "auto_remove": False,
-            "ports": {f"{CONTAINER_INTERNAL_PORT}/tcp": host_port},
+            "ports": {f"{CONTAINER_INTERNAL_PORT}/tcp": ("127.0.0.1", host_port)},
             "environment": {"DEVICE": "cuda" if gpu_enabled else "cpu"},
             "mem_limit": CONTAINER_MEMORY_LIMIT,
             "shm_size": CONTAINER_SHM_SIZE,
@@ -498,6 +514,22 @@ def run_container_inference(
                 "quasar.role": "miner-verification",
             },
             "name": f"quasar-verify-{hotkey[:12]}-{int(time.time())}",
+            # --- Security hardening ---
+            # Internal network: container can serve on the mapped port
+            # but CANNOT reach the internet or LAN.
+            "network": verify_network.name,
+            "cap_drop": ["ALL"],
+            # Re-add only the minimum capabilities needed for GPU +
+            # serving on the mapped port.
+            "cap_add": ["SYS_PTRACE"],  # needed by some CUDA runtimes
+            "read_only": True,
+            "security_opt": ["no-new-privileges"],
+            "pids_limit": 1024,
+            # Writable dirs the inference server may need
+            "tmpfs": {
+                "/tmp": "size=2G",
+                "/root/.cache": "size=4G",
+            },
         }
         if gpu_enabled:
             run_kwargs["device_requests"] = [
@@ -507,7 +539,7 @@ def run_container_inference(
         log(f"Starting container on host port {host_port}...", "start")
         container = client.containers.run(**run_kwargs)
 
-        # 3. Wait for health
+        # 4. Wait for health
         log("Waiting for container health...", "info")
         healthy = _wait_for_container_health(host_port, timeout=CONTAINER_STARTUP_TIMEOUT)
         if not healthy:
@@ -525,7 +557,7 @@ def run_container_inference(
             )
         log("Container healthy", "success")
 
-        # 4. Call /inference -- validator measures wall-clock time independently
+        # 5. Call /inference -- validator measures wall-clock time independently
         inference_url = f"http://127.0.0.1:{host_port}/inference"
         payload: Dict[str, Any] = {
             "prompt": prompt,
