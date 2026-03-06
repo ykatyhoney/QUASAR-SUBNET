@@ -69,6 +69,23 @@ class PerformanceValidator:
         "import fla.ops.kda",
     ]
 
+    # Dangerous built-ins / modules that must never appear in miner code.
+    # Checked via AST so dynamic tricks (string concat, getattr) in source
+    # are caught at the call-site level.
+    DANGEROUS_CALLS = {
+        "__import__", "exec", "eval", "compile",
+        "os.system", "os.popen", "os.exec",
+        "os.execl", "os.execle", "os.execlp", "os.execlpe",
+        "os.execv", "os.execve", "os.execvp", "os.execvpe",
+        "os.spawn", "os.spawnl", "os.spawnle",
+        "subprocess.run", "subprocess.call", "subprocess.Popen",
+        "subprocess.check_output", "subprocess.check_call",
+    }
+    DANGEROUS_IMPORT_MODULES = {
+        "importlib", "ctypes", "socket", "http",
+        "urllib", "requests", "paramiko", "fabric",
+    }
+
     def __init__(self, validator_instance=None):
         """
         Initialize PerformanceValidator.
@@ -82,12 +99,95 @@ class PerformanceValidator:
         self.validator_instance = validator_instance  # Reference to main Validator for logit verification
         print(f"[VALIDATOR] Initialized with temp dir: {self.temp_dir}")
 
-    def validate_imports(self, repo_path: str) -> tuple[bool, List[str]]:
-        """Validate that files have required imports and no forbidden imports."""
-        quasar_dir = os.path.join(repo_path, "fla/ops/quasar")
-        target_files = ["chunk.py", "chunk_intra_token_parallel.py", "forward_substitution.py", "fused_recurrent.py", "gate.py"]
+    # --- AST helpers -----------------------------------------------------------
 
-        errors = []
+    @staticmethod
+    def _ast_imported_names(tree) -> set:
+        """Return all imported module/name strings from an AST tree."""
+        import ast
+        names: set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                names.add(module)
+                for alias in node.names:
+                    names.add(f"{module}.{alias.name}" if module else alias.name)
+        return names
+
+    @staticmethod
+    def _ast_called_names(tree) -> set:
+        """Return dotted call-names (e.g. 'os.system') found in the AST."""
+        import ast
+        calls: set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                parts = []
+                while isinstance(func, ast.Attribute):
+                    parts.append(func.attr)
+                    func = func.value
+                if isinstance(func, ast.Name):
+                    parts.append(func.id)
+                if parts:
+                    parts.reverse()
+                    calls.add(".".join(parts))
+        return calls
+
+    # --- Main validation entry point -----------------------------------------
+
+    def validate_imports(self, repo_path: str) -> tuple[bool, List[str]]:
+        """Validate miner repo using AST parsing.
+
+        1. Scan .py files under fla/ for dangerous calls / imports.
+        2. Check the 5 target files exist with required/forbidden imports.
+        """
+        import ast
+        import glob as _glob
+
+        errors: List[str] = []
+
+        # --- Phase 1: deep-scan .py files under fla/ for dangerous patterns ---
+        # Scoped to fla/ to avoid false positives from the base repo's own
+        # setup.py, tests/, benchmarks/, etc. which legitimately use os/subprocess.
+        fla_root = os.path.join(repo_path, "fla")
+        all_py = _glob.glob(os.path.join(fla_root, "**", "*.py"), recursive=True) if os.path.isdir(fla_root) else []
+        for py_path in all_py:
+            rel = os.path.relpath(py_path, repo_path)
+            try:
+                with open(py_path, "r", encoding="utf-8") as f:
+                    source = f.read()
+                tree = ast.parse(source, filename=rel)
+            except SyntaxError:
+                errors.append(f"{rel}: SyntaxError - file cannot be parsed")
+                continue
+
+            # Dangerous calls
+            called = self._ast_called_names(tree)
+            for dc in self.DANGEROUS_CALLS:
+                if dc in called:
+                    errors.append(f"{rel}: Dangerous call detected: {dc}()")
+
+            # Dangerous module imports
+            imported = self._ast_imported_names(tree)
+            for mod in self.DANGEROUS_IMPORT_MODULES:
+                for imp in imported:
+                    if imp == mod or imp.startswith(f"{mod}."):
+                        errors.append(
+                            f"{rel}: Dangerous module imported: {imp}"
+                        )
+
+        # --- Phase 2: target-file checks (required + forbidden imports) ------
+        quasar_dir = os.path.join(repo_path, "fla/ops/quasar")
+        target_files = [
+            "chunk.py",
+            "chunk_intra_token_parallel.py",
+            "forward_substitution.py",
+            "fused_recurrent.py",
+            "gate.py",
+        ]
 
         for filename in target_files:
             file_path = os.path.join(quasar_dir, filename)
@@ -95,90 +195,34 @@ class PerformanceValidator:
                 errors.append(f"Missing file: {filename}")
                 continue
 
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    source = f.read()
+                tree = ast.parse(source, filename=filename)
+            except SyntaxError:
+                errors.append(f"{filename}: SyntaxError - cannot parse")
+                continue
 
-            # Check for forbidden imports
+            imported = self._ast_imported_names(tree)
+
+            # Forbidden imports (AST-level)
             for forbidden in self.FORBIDDEN_IMPORTS:
-                if forbidden in content:
-                    errors.append(f"{filename}: Forbidden import found: {forbidden}")
+                mod = forbidden.replace("from ", "").replace("import ", "").strip()
+                for imp in imported:
+                    if imp == mod or imp.startswith(f"{mod}."):
+                        errors.append(
+                            f"{filename}: Forbidden import found: {forbidden}"
+                        )
 
-            # Check for required imports (only for chunk.py - these are CRITICAL)
+            # Required imports (only for chunk.py)
             if filename == "chunk.py":
                 for required in self.REQUIRED_IMPORTS_CHUNK_PY:
-                    # Extract the import name (e.g., "autocast_custom_bwd" from "from fla.utils import autocast_custom_bwd")
                     import_name = required.split("import")[-1].strip()
-                    found = False
-                    
-                    # Normalize content for comparison (remove comments, normalize whitespace)
-                    normalized_content = content
-                    # Remove single-line comments
-                    lines = normalized_content.split('\n')
-                    cleaned_lines = []
-                    for line in lines:
-                        # Remove comments but keep the line structure
-                        if '#' in line:
-                            comment_pos = line.find('#')
-                            # Check if # is in a string
-                            if line[:comment_pos].count('"') % 2 == 0 and line[:comment_pos].count("'") % 2 == 0:
-                                line = line[:comment_pos]
-                        cleaned_lines.append(line)
-                    normalized_content = '\n'.join(cleaned_lines)
-                    
-                    # Check exact match first
-                    if required in normalized_content:
-                        found = True
-                    # Check case-insensitive match
-                    elif required.lower() in normalized_content.lower():
-                        found = True
-                    # Check for multi-line imports: from fla.utils import (\n    autocast_custom_bwd,\n    ...)
-                    elif f"from fla.utils import" in normalized_content.lower():
-                        # Find all import lines and continuation lines
-                        import_blocks = []
-                        lines = normalized_content.split('\n')
-                        in_import_block = False
-                        current_block = []
-                        
-                        for i, line in enumerate(lines):
-                            line_lower = line.lower().strip()
-                            if 'from fla.utils import' in line_lower:
-                                in_import_block = True
-                                current_block = [line]
-                                # Check if it's a single-line import
-                                if ')' not in line and '(' not in line:
-                                    import_blocks.append(line)
-                                    in_import_block = False
-                                    current_block = []
-                            elif in_import_block:
-                                current_block.append(line)
-                                if ')' in line or (line.strip().endswith(',') and i < len(lines) - 1 and 'from' in lines[i+1].lower()):
-                                    import_blocks.append('\n'.join(current_block))
-                                    in_import_block = False
-                                    current_block = []
-                        
-                        # Check if import_name appears in any import block
-                        for block in import_blocks:
-                            if import_name.lower() in block.lower():
-                                found = True
-                                break
-                    
-                    # Final check: simple string search for the import name near "from fla.utils"
-                    if not found:
-                        # Look for the import name anywhere in the file (as a fallback)
-                        # This handles cases where imports might be reformatted
-                        import_patterns = [
-                            f"from fla.utils import {import_name}",
-                            f"from fla.utils import ({import_name}",
-                            f"{import_name},",
-                            f"{import_name})",
-                        ]
-                        for pattern in import_patterns:
-                            if pattern.lower() in normalized_content.lower():
-                                found = True
-                                break
-                    
-                    if not found:
-                        errors.append(f"{filename}: Missing required import: {required}")
+                    expected = f"fla.utils.{import_name}"
+                    if expected not in imported:
+                        errors.append(
+                            f"{filename}: Missing required import: {required}"
+                        )
 
         return len(errors) == 0, errors
     
