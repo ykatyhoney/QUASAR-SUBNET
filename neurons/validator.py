@@ -701,14 +701,16 @@ if __name__ == "__main__":
                 }
             print(f"[VALIDATOR] ✅ Import validation passed")
 
-            # Run benchmarks for all reported sequence lengths
+            # Run benchmarks for all reported sequence lengths.
+            # JSON keys are always strings, so normalize to int to avoid
+            # TypeError when sorting mixed str/int.
             seq_lengths_to_test = sorted(
                 set([512, 1024, 2048, int(target_sequence_length)])
             )
             if claimed_benchmarks:
                 seq_lengths_to_test = sorted(
                     set(
-                        list(claimed_benchmarks.keys())
+                        [int(k) for k in claimed_benchmarks.keys()]
                         + [int(target_sequence_length)]
                     )
                 )
@@ -761,11 +763,10 @@ if __name__ == "__main__":
             # Compare all reported sequence lengths
             print(f"[VALIDATOR] Benchmark comparison:")
             for seq_len in (
-                sorted(claimed_benchmarks.keys()) if claimed_benchmarks else []
+                sorted(int(k) for k in claimed_benchmarks.keys()) if claimed_benchmarks else []
             ):
-                claimed = claimed_benchmarks.get(seq_len, {}).get(
-                    "tokens_per_sec", 0
-                )
+                claimed = claimed_benchmarks.get(str(seq_len), claimed_benchmarks.get(seq_len, {}))
+                claimed = claimed.get("tokens_per_sec", 0) if isinstance(claimed, dict) else 0
                 actual = results_by_seq_len.get(seq_len, {}).get(
                     "tokens_per_sec", 0
                 )
@@ -1608,7 +1609,7 @@ class Validator(BaseValidatorNeuron):
                                     payload["cosine_similarity"] = verification_result["cosine_similarity"]
                                 if verification_result.get("max_abs_diff") is not None:
                                     payload["max_abs_diff"] = verification_result["max_abs_diff"]
-                                tp = verification_result.get("throughput_verified") or verification_result.get("reference_throughput")
+                                tp = verification_result.get("miner_throughput") or verification_result.get("reference_throughput")
                                 if tp is not None:
                                     payload["throughput"] = tp
                                 if verification_result.get("reason"):

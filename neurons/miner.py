@@ -830,30 +830,8 @@ class Miner(BaseMinerNeuron):
                     print(f"[API] Response text: {response.text[:500]}", flush=True)
 
                     if response.status_code == 422:
-                        minimal_payload = {
-                            "miner_hotkey": payload["miner_hotkey"],
-                            "fork_url": payload["fork_url"],
-                            "commit_hash": payload["commit_hash"],
-                            "target_sequence_length": payload["target_sequence_length"],
-                            "tokens_per_sec": payload["tokens_per_sec"],
-                            "signature": self._sign_message(f"{fork_url}{commit_hash}{performance}"),
-                        }
-                        response = self._api_request(
-                            "POST",
-                            "/submit_optimization",
-                            headers=headers,
-                            json=minimal_payload,
-                            timeout=120,
-                        )
-
-                        if response is None:
-                            raise RuntimeError("Failed to create submission request")
-
-                        response.raise_for_status()
-                        result = response.json()
-                        bt.logging.info(f"Submission successful: {result.get('submission_id')}")
-                        print(f"[API] Submission successful: {result.get('submission_id')}", flush=True)
-                        return True
+                        detail = response.json().get("detail", response.text[:500])
+                        raise ValueError(f"Validation error from /submit_kernel: {detail}")
 
                     response.raise_for_status()
                     result = response.json()

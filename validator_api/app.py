@@ -823,6 +823,7 @@ def submit_kernel(
             miner_hotkey=new_submission.miner_hotkey,
             fork_url=new_submission.fork_url,
             commit_hash=new_submission.commit_hash,
+            repo_hash=new_submission.repo_hash,
             target_sequence_length=new_submission.target_sequence_length,
             tokens_per_sec=new_submission.tokens_per_sec,
             vram_mb=new_submission.vram_mb,
@@ -836,18 +837,6 @@ def submit_kernel(
         print(f"❌ [SUBMIT_KERNEL] Error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-    
-    return models.SpeedSubmissionResponse(
-        submission_id=new_submission.id,
-        miner_hotkey=new_submission.miner_hotkey,
-        fork_url=new_submission.fork_url,
-        commit_hash=new_submission.commit_hash,
-        repo_hash=new_submission.repo_hash,
-        target_sequence_length=new_submission.target_sequence_length,
-        tokens_per_sec=new_submission.tokens_per_sec,
-        docker_image=new_submission.docker_image,
-        created_at=new_submission.created_at
-    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════
@@ -859,13 +848,33 @@ def submit_kernel(
 BLOCKS_UNTIL_REVEAL = int(os.environ.get("BLOCKS_UNTIL_REVEAL", 100))  # ~20 minutes
 BLOCK_TIME_SECONDS = 12  # Bittensor block time
 
+_subtensor_instance = None
+
+def _get_subtensor():
+    global _subtensor_instance
+    if _subtensor_instance is None:
+        try:
+            import bittensor as bt
+            network = os.environ.get("SUBTENSOR_NETWORK", "finney")
+            _subtensor_instance = bt.subtensor(network=network)
+        except Exception as e:
+            print(f"⚠️ [BLOCK] Failed to connect to subtensor: {e}", flush=True)
+    return _subtensor_instance
+
 def get_current_block() -> int:
-    """Get current Bittensor block number (approximation based on time)."""
-    # In production, this should query the actual chain
-    # For now, use time-based approximation (genesis + seconds/12)
+    """Get current Bittensor block number from the chain, with time-based fallback."""
+    try:
+        sub = _get_subtensor()
+        if sub is not None:
+            block = sub.get_current_block()
+            return int(block)
+    except Exception as e:
+        print(f"⚠️ [BLOCK] Chain query failed, using time fallback: {e}", flush=True)
+    # Fallback: time-based approximation (only used if chain is unreachable).
+    # Not accurate for absolute block numbers but preserves relative timing
+    # for commit-reveal delays.
     import time
-    # Approximate genesis time for Bittensor mainnet
-    GENESIS_TIME = 1609459200  # Jan 1, 2021 UTC
+    GENESIS_TIME = 1687939200  # ~Jun 28, 2023 (Bittensor finney approximate genesis)
     current_time = int(time.time())
     return (current_time - GENESIS_TIME) // BLOCK_TIME_SECONDS
 
