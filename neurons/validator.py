@@ -454,7 +454,11 @@ if __name__ == "__main__":
           - bounded memory and timeout
 
         Returns:
-            Dict with keys: tokens_per_sec, vram_mb
+            Dict with keys: tokens_per_sec, vram_mb.
+            If the failure is due to validator infrastructure (Docker
+            not running, GPU unavailable), the dict also contains
+            ``infra_failure: True`` so callers can leave the
+            submission pending for retry.
         """
         print(
             f"[VALIDATOR] Running sandboxed performance test "
@@ -478,7 +482,20 @@ if __name__ == "__main__":
                     repo_path, temp_test_script
                 )
 
-            client = _docker.from_env()
+            try:
+                client = _docker.from_env()
+                client.ping()
+            except Exception as dock_err:
+                print(
+                    f"[VALIDATOR] CRITICAL: Docker daemon not reachable: "
+                    f"{dock_err}. Marking as infra failure so submission "
+                    f"stays pending."
+                )
+                return {
+                    "tokens_per_sec": 0.0,
+                    "vram_mb": 0.0,
+                    "infra_failure": True,
+                }
 
             run_kwargs = {
                 "image": self.SANDBOX_IMAGE,
@@ -524,7 +541,11 @@ if __name__ == "__main__":
                     f"sandbox container: {gpu_err}. "
                     f"CPU-only benchmarks are not comparable -- aborting."
                 )
-                return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+                return {
+                    "tokens_per_sec": 0.0,
+                    "vram_mb": 0.0,
+                    "infra_failure": True,
+                }
 
             container = None
             try:
@@ -570,7 +591,7 @@ if __name__ == "__main__":
             "Install the 'docker' Python package and ensure Docker "
             "daemon is running."
         )
-        return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+        return {"tokens_per_sec": 0.0, "vram_mb": 0.0, "infra_failure": True}
 
     @staticmethod
     def _parse_test_output(output: str) -> Dict[str, float]:
@@ -693,10 +714,13 @@ if __name__ == "__main__":
                 )
 
             results_by_seq_len: Dict[int, Dict[str, float]] = {}
+            infra_failure = False
             for seq_len in seq_lengths_to_test:
-                results_by_seq_len[seq_len] = self.run_performance_test(
-                    repo_path, seq_len
-                )
+                res = self.run_performance_test(repo_path, seq_len)
+                results_by_seq_len[seq_len] = res
+                if res.get("infra_failure"):
+                    infra_failure = True
+                    break
 
             target_results = results_by_seq_len.get(
                 int(target_sequence_length),
@@ -771,14 +795,18 @@ if __name__ == "__main__":
                 "repo_hash": repo_hash,  # Include repo_hash in result
             }
 
+            if infra_failure:
+                result["infra_failure"] = True
+
             # Add verification result if available
             if verification_result:
                 result["verification"] = verification_result
 
             return result
 
-        except Exception as e:
-            print(f"[VALIDATOR] Validation failed: {e}")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            # Miner code fault — score zero, mark as validated
+            print(f"[VALIDATOR] Miner code error: {e}")
             traceback.print_exc()
             return {
                 "submission_id": submission.get("id"),
@@ -787,6 +815,19 @@ if __name__ == "__main__":
                 "actual_performance": 0.0,
                 "score": 0.0,
                 "error": str(e),
+            }
+        except Exception as e:
+            # Infrastructure fault — leave submission pending for retry
+            print(f"[VALIDATOR] Infra failure during validation: {e}")
+            traceback.print_exc()
+            return {
+                "submission_id": submission.get("id"),
+                "miner_hotkey": submission.get("miner_hotkey"),
+                "claimed_performance": claimed_performance,
+                "actual_performance": 0.0,
+                "score": 0.0,
+                "error": str(e),
+                "infra_failure": True,
             }
 
     def cleanup(self):
@@ -1467,6 +1508,16 @@ class Validator(BaseValidatorNeuron):
                 result = self.performance_validator.validate_submission(
                     submission
                 )
+
+                # Infrastructure failure — skip this submission so it
+                # stays pending and can be retried on the next cycle.
+                if result.get("infra_failure"):
+                    print(
+                        f"[VALIDATOR] ⚠️ Infra failure for submission "
+                        f"{submission.get('id')} — will retry later",
+                        flush=True,
+                    )
+                    break
 
                 miner_hotkey = result.get("miner_hotkey")
                 score = result.get("score", 0.0)
