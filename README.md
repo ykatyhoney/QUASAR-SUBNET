@@ -110,76 +110,61 @@ python -m neurons.miner \
 
 #### BYOC Mode (Bring Your Own Code)
 
-If you already have an optimized kernel implementation, you can use **BYOC mode** to feed it directly to the miner instead of relying on the LLM to generate one from scratch. This is useful when:
+Two BYOC modes are available:
 
-- You have a hand-optimized CUDA kernel
-- You want to use an existing optimized implementation as a reference
-- You want to improve upon an existing optimization
-
-**Usage**:
-
-1. **Set the BYOC file path** in `.env`:
-   ```bash
-   BYOC_FILE_PATH=./path/to/your/optimized/chunk.py
-   ./START_MINER.sh
-   ```
-
-2. **Or export it before running** the startup script:
-   ```bash
-   export BYOC_FILE_PATH=./path/to/your/optimized/chunk.py
-   ./START_MINER.sh
-   ```
-
-3. **Or use command line arguments directly** (bypassing the startup script):
-   ```bash
-   python -m neurons.miner \
-     --wallet.name "$WALLET_MINER_NAME" \
-     --wallet.hotkey "$WALLET_HOTKEY" \
-     --subtensor.network "$SUBTENSOR_NETWORK" \
-     --netuid "$NETUID" \
-     --byoc-file ./path/to/your/optimized/chunk.py
-   ```
-
-**How it works**:
-
-- The miner will use your provided code as an **expert reference** during code generation
-- The LLM will adapt your code to match the repository structure and requirements
-- Your code's implementation approach will guide the optimization process
-- The miner will still ensure all required imports are included and the code matches the expected signatures
-
-**Tips**:
-
-- Start with a smaller target sequence length first (e.g., `TARGET_SEQUENCE_LENGTH=100000`) - 100k is easier to optimize for
-- Make sure your BYOC file includes all required imports (see [Required Imports](#required-imports-critical) below)
-- The file should be a valid Python file that can be imported and tested
-
-**Example**:
+**BYOC Reference** — LLM uses your code as a reference to guide optimization:
 
 ```bash
-# Using environment variable
-export BYOC_FILE_PATH=./my_optimized_kernels/chunk.py
-export TARGET_SEQUENCE_LENGTH=100000
-./START_MINER.sh
+BYOC_FILE_PATH=./my_chunk.py ./START_MINER.sh
+```
 
-# Or using command line argument
+**BYOC Direct** — Skip the LLM entirely, submit your code directly (no GPU needed for code gen):
+
+```bash
+# Single file
+BYOC_DIRECT=true BYOC_FILE_PATH=./my_chunk.py ./START_MINER.sh
+
+# Directory with multiple target files
+BYOC_DIRECT=true BYOC_DIR=./my_kernels/ ./START_MINER.sh
+```
+
+Or via CLI:
+
+```bash
 python -m neurons.miner \
   --wallet.name "$WALLET_MINER_NAME" \
   --wallet.hotkey "$WALLET_HOTKEY" \
   --subtensor.network "$SUBTENSOR_NETWORK" \
   --netuid "$NETUID" \
-  --byoc-file ./my_optimized_kernels/chunk.py \
-  --target-seq-len 100000
+  --byoc-direct --byoc-file ./my_chunk.py
 ```
+
+BYOC Direct will: copy your files into the fork, validate imports, run benchmarks, commit+push to GitHub, and submit to the Validator API.
+
+**Tips**:
+
+- Make sure your code includes all [required imports](#required-imports-critical) or the validator will reject with score 0.0
+- Use absolute paths for `BYOC_FILE_PATH` / `BYOC_DIR`
+- Target files: `chunk.py`, `fused_recurrent.py`, `gate.py`, `forward_substitution.py`, `chunk_intra_token_parallel.py`, `__init__.py`
 
 ### Validator Neuron
 
-Location: `neurons/validator.py`  
+Location: `neurons/validator.py`
 Role: Bittensor neuron that:
 
 - Polls the Validator API for new submissions
 - Validates miner code, imports, and kernel behavior
-- Runs benchmark tasks and computes rewards
+- Runs benchmark tasks inside a **sandboxed Docker container**
 - Verifies miner outputs using **logit verification** against a reference model
+
+**Prerequisites** (before running the validator):
+
+```bash
+# REQUIRED: Build the sandbox image for miner code benchmarking
+cd miner && docker build -f Dockerfile.inference -t quasar-miner-gpu:latest .
+```
+
+Without this image, all performance tests will fail with `pull access denied` and miners will not be scored.
 
 Local run (using `.env`):
 
@@ -193,6 +178,7 @@ This configures:
 - `SUBTENSOR_NETWORK`
 - `WALLET_VALIDATOR_NAME`
 - `WALLET_HOTKEY`
+- `VALIDATOR_SANDBOX_IMAGE` (default: `quasar-miner-gpu:latest`)
 - Inference verification parameters (`ENABLE_LOGIT_VERIFICATION`, `REFERENCE_MODEL`, thresholds)
 - Commit–reveal timings (`BLOCKS_UNTIL_REVEAL`, `BLOCK_TIME_SECONDS`)
 
@@ -417,9 +403,12 @@ Defined in `.env`:
 | `MAX_ABS_DIFF_THRESHOLD`| `0.1`                                         | Validator neuron        |
 | `BLOCKS_UNTIL_REVEAL`   | `100`                                         | Commit–reveal           |
 | `BLOCK_TIME_SECONDS`    | `12`                                          | Commit–reveal           |
-| `DOCKER_USERNAME`       | `dokerhub_username`                                 | Bazel / oci_push        |
-| `BYOC_FILE_PATH`        | `./path/to/optimized/chunk.py`                     | Miner (BYOC mode)       |
-| `REPO_PATH`             | `./path/to/local/repo`                             | Miner (BYOC mode)       |
+| `DOCKER_USERNAME`       | `dockerhub_username`                                | Bazel / oci_push        |
+| `VALIDATOR_SANDBOX_IMAGE`| `quasar-miner-gpu:latest`                          | Validator (benchmarking) |
+| `BYOC_DIRECT`           | `true` / `false`                                    | Miner (BYOC direct)     |
+| `BYOC_FILE_PATH`        | `/path/to/optimized/chunk.py`                       | Miner (BYOC mode)       |
+| `BYOC_DIR`              | `/path/to/optimized/kernels/`                       | Miner (BYOC direct)     |
+| `REPO_PATH`             | `./path/to/local/repo`                              | Miner (BYOC mode)       |
 
 ---
 
