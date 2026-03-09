@@ -25,7 +25,7 @@ oci_image(
     tars = [":miner_files_tar"],
     env = {
         "PYTHONUNBUFFERED": "1",
-        "MODEL_NAME": "Qwen/Qwen2.5-0.5B-Instruct",
+        "MODEL_NAME": "Qwen/Qwen3-4B-Instruct-2507",
         "DEVICE": "cuda",
         "HOST": "0.0.0.0",
         "PORT": "8000",
@@ -41,7 +41,7 @@ oci_image(
     tars = [":miner_files_tar"],
     env = {
         "PYTHONUNBUFFERED": "1",
-        "MODEL_NAME": "Qwen/Qwen2.5-0.5B-Instruct",
+        "MODEL_NAME": "Qwen/Qwen3-4B-Instruct-2507",
         "DEVICE": "cpu",
         "HOST": "0.0.0.0",
         "PORT": "8000",

@@ -1157,12 +1157,14 @@ class Validator(BaseValidatorNeuron):
             # Without one, the submission cannot be verified and will not rank.
             if not docker_image:
                 print(
-                    f"[VALIDATOR]   No docker_image for submission {submission_id} - FAIL (mandatory)",
+                    f"[VALIDATOR]   No docker_image for submission {submission_id} - FAIL (mandatory). "
+                    f"Miner must set DOCKER_USERNAME env var and push their inference container.",
                     flush=True,
                 )
                 return {
                     "verified": False,
-                    "reason": "No docker_image provided - logit verification is mandatory",
+                    "reason": "No docker_image provided. Miner must set DOCKER_USERNAME and push "
+                              "their inference container (see Dockerfile.inference).",
                     "repo_hash": repo_hash,
                 }
 
@@ -1538,19 +1540,6 @@ class Validator(BaseValidatorNeuron):
                     # LOGIT VERIFICATION (from const's qllm architecture)
                     # Run after performance test passes to verify miner is running actual model
                     # ═══════════════════════════════════════════════════════════════════════
-<<<<<<< fix/critical-logic-bugs
-                    verification_result = None
-                    if not submission.get("is_revealed", True):
-                        # Unrevealed submissions should not reach here
-                        # (get_pending_validations filters them), but guard anyway.
-                        print(f"[VALIDATOR] ⏳ Submission {submission_id} not yet revealed, skipping", flush=True)
-                        continue
-                    elif self.logit_verification_enabled and submission_id:
-                        print(f"[VALIDATOR] 🔍 Running logit verification...", flush=True)
-                        docker_image = submission.get("docker_image")
-                        fork_url = submission.get("fork_url") or result.get("fork_url")
-                        commit_hash = submission.get("commit_hash") or result.get("commit_hash")
-=======
                     if self.logit_verification_enabled and submission_id:
                         print(
                             f"[VALIDATOR] 🔍 Running logit verification...",
@@ -1566,7 +1555,6 @@ class Validator(BaseValidatorNeuron):
                         ) or result.get("commit_hash")
                         # Note: repo_path is not available here (already cleaned up)
                         # Context will be built from fork_url + commit_hash
->>>>>>> main
                         verification_result = self.run_logit_verification(
                             submission_id=submission_id,
                             docker_image=docker_image,
@@ -1575,13 +1563,6 @@ class Validator(BaseValidatorNeuron):
                             commit_hash=commit_hash,
                         )
 
-<<<<<<< fix/critical-logic-bugs
-                        if verification_result.get("verified") == True:
-                            evaluated_scores[miner_hotkey] = normalized_score
-                        else:
-                            v_status = "FAILED" if verification_result.get("verified") == False else "NOT RUN"
-                            print(f"[VALIDATOR] ❌ Logit verification {v_status} - score set to 0", flush=True)
-=======
                         # Record verification result to API
                         self.record_verification_result(
                             submission_id, verification_result
@@ -1600,20 +1581,15 @@ class Validator(BaseValidatorNeuron):
                                 f"[VALIDATOR] ❌ Logit verification {status} - score set to 0",
                                 flush=True,
                             )
->>>>>>> main
                             normalized_score = 0.0
                             evaluated_scores[miner_hotkey] = 0.0
                     else:
                         verification_result = None
                         evaluated_scores[miner_hotkey] = normalized_score
 
-<<<<<<< fix/critical-logic-bugs
-                    # Atomically mark validated + record verification in one API call
-=======
                     # Mark submission as validated in API and record score
                     # Send the validator-measured actual_tokens_per_sec so rankings
                     # use the real value, not the miner-claimed one.
->>>>>>> main
                     actual_tps = result.get("actual_performance", 0.0)
                     if submission_id:
                         try:
@@ -1660,11 +1636,6 @@ class Validator(BaseValidatorNeuron):
                                     flush=True,
                                 )
                             else:
-<<<<<<< fix/critical-logic-bugs
-                                print(f"[VALIDATOR] ⚠️ Failed to mark submission: {response.status_code} - {response.text}", flush=True)
-                        except Exception as e:
-                            print(f"[VALIDATOR] Failed to mark submission: {e}", flush=True)
-=======
                                 print(
                                     f"[VALIDATOR] ⚠️ Failed to mark submission as validated: {response.status_code} - {response.text}",
                                     flush=True,
@@ -1674,7 +1645,6 @@ class Validator(BaseValidatorNeuron):
                                 f"[VALIDATOR] Failed to mark submission as validated: {e}",
                                 flush=True,
                             )
->>>>>>> main
                 else:
                     print(
                         f"[VALIDATOR] ❌ Invalid submission from {miner_hotkey[:12]}...",
@@ -1711,16 +1681,11 @@ class Validator(BaseValidatorNeuron):
                                 "score": 0.0,
                             }
                             response = requests.post(
-<<<<<<< fix/critical-logic-bugs
-                                f"{VALIDATOR_API_URL}/mark_validated_with_verification",
-                                json=fail_payload,
-=======
                                 f"{VALIDATOR_API_URL}/mark_validated",
                                 json={
                                     "submission_id": submission_id,
                                     "score": 0.0,
                                 },
->>>>>>> main
                                 headers=self._api_auth_headers(),
                                 timeout=30,
                             )

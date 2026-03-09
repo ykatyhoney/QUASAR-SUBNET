@@ -619,6 +619,10 @@ def submit_kernel(
     try:
         print(f"📥 [SUBMIT_KERNEL] Miner: {req.miner_hotkey[:8]} | Fork: {req.fork_url}")
         print(f"📥 [SUBMIT_KERNEL] Commit: {req.commit_hash[:12]}... | Performance: {req.tokens_per_sec:.2f} tokens/sec")
+        if req.docker_image:
+            print(f"📥 [SUBMIT_KERNEL] Docker Image: {req.docker_image}")
+        else:
+            print(f"⚠️ [SUBMIT_KERNEL] No docker_image — logit verification will FAIL for this submission")
         if req.repo_hash:
             print(f"📥 [SUBMIT_KERNEL] Repo Hash: {req.repo_hash} (context consistency)")
         if req.vram_mb is not None:
@@ -798,6 +802,7 @@ def submit_kernel(
             tokens_per_sec=req.tokens_per_sec,
             vram_mb=req.vram_mb,
             benchmarks=json.dumps(req.benchmarks) if req.benchmarks else None,
+            docker_image=req.docker_image, 
             signature=req.signature,
             round_id=current_round.id,
             solution_hash=solution_hash,
@@ -822,6 +827,7 @@ def submit_kernel(
             tokens_per_sec=new_submission.tokens_per_sec,
             vram_mb=new_submission.vram_mb,
             benchmarks=json.loads(new_submission.benchmarks) if new_submission.benchmarks else None,
+            docker_image=new_submission.docker_image,
             created_at=new_submission.created_at
         )
     except HTTPException:
@@ -839,6 +845,7 @@ def submit_kernel(
         repo_hash=new_submission.repo_hash,
         target_sequence_length=new_submission.target_sequence_length,
         tokens_per_sec=new_submission.tokens_per_sec,
+        docker_image=new_submission.docker_image,
         created_at=new_submission.created_at
     )
 

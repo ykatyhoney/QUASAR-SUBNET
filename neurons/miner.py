@@ -775,6 +775,23 @@ class Miner(BaseMinerNeuron):
                 signature_data += f"{self.repo_hash}"
             
             network = "test" if str(os.getenv("BT_NETWORK", "finney")).lower() == "test" else "finney"
+
+            # Docker image for logit verification. Validators pull this image
+            # to run inference and compare logits against the reference model.
+            # Priority: MINER_DOCKER_IMAGE env > DOCKER_USERNAME-derived name
+            # Default convention matches Bazel build: <user>/quasar-miner-gpu:latest
+            docker_image = os.getenv("MINER_DOCKER_IMAGE")
+            if not docker_image:
+                docker_username = os.getenv("DOCKER_USERNAME", "")
+                if docker_username:
+                    docker_image = f"{docker_username}/quasar-miner-gpu:latest"
+            if docker_image:
+                print(f"[MINER] Docker image for verification: {docker_image}", flush=True)
+            else:
+                print(f"[MINER] WARNING: No docker_image set. Logit verification will FAIL.", flush=True)
+                print(f"[MINER] Set DOCKER_USERNAME or MINER_DOCKER_IMAGE env var.", flush=True)
+                print(f"[MINER] Build & push with: cd docker-build && bash push_miner.sh", flush=True)
+
             payload = {
                 "miner_hotkey": self.wallet.hotkey.ss58_address,
                 "fork_url": fork_url,
@@ -784,6 +801,7 @@ class Miner(BaseMinerNeuron):
                 "tokens_per_sec": target_metrics.get("tokens_per_sec", performance),
                 "vram_mb": float(target_metrics.get("vram_mb", 0.0)),
                 "benchmarks": benchmarks,
+                "docker_image": docker_image,
                 "signature": self._sign_message(signature_data),
                 "network": network,
             }

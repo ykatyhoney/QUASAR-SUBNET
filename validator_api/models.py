@@ -246,6 +246,7 @@ class SpeedSubmissionRequest(BaseModel):
     tokens_per_sec: float
     vram_mb: Optional[float] = None
     benchmarks: Optional[Dict[str, Dict[str, float]]] = None
+    docker_image: Optional[str] = None  # Docker image for logit verification (REQUIRED to pass verification)
     signature: str
     network: Optional[str] = None  # "finney" (mainnet) or "test" (testnet); default finney
 
@@ -259,6 +260,7 @@ class SpeedSubmissionResponse(BaseModel):
     tokens_per_sec: float
     vram_mb: Optional[float] = None
     benchmarks: Optional[Dict[str, Dict[str, float]]] = None
+    docker_image: Optional[str] = None  # Docker image for logit verification
     created_at: datetime
 
     class Config:
