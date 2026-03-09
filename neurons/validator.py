@@ -1238,10 +1238,12 @@ class Validator(BaseValidatorNeuron):
                     # LOGIT VERIFICATION (from const's qllm architecture)
                     # Run after performance test passes to verify miner is running actual model
                     # ═══════════════════════════════════════════════════════════════════════
+                    verification_result = None
                     if not submission.get("is_revealed", True):
-                        print(f"[VALIDATOR] ⏳ Submission {submission_id} not yet revealed, skipping verification", flush=True)
-                        evaluated_scores[miner_hotkey] = 0.0
-                        normalized_score = 0.0
+                        # Unrevealed submissions should not reach here
+                        # (get_pending_validations filters them), but guard anyway.
+                        print(f"[VALIDATOR] ⏳ Submission {submission_id} not yet revealed, skipping", flush=True)
+                        continue
                     elif self.logit_verification_enabled and submission_id:
                         print(f"[VALIDATOR] 🔍 Running logit verification...", flush=True)
                         docker_image = submission.get("docker_image")
@@ -1297,6 +1299,16 @@ class Validator(BaseValidatorNeuron):
                                 headers=self._api_auth_headers(),
                                 timeout=30
                             )
+                            # Fallback: API hasn't been updated yet
+                            if response.status_code == 404:
+                                response = requests.post(
+                                    f"{VALIDATOR_API_URL}/mark_validated",
+                                    json=payload,
+                                    headers=self._api_auth_headers(),
+                                    timeout=30
+                                )
+                                if verification_result is not None:
+                                    self.record_verification_result(submission_id, verification_result)
                             if response.status_code == 200:
                                 print(f"[VALIDATOR] ✅ Submission {submission_id} marked validated: score={normalized_score:.4f}, actual_tps={actual_tps:.2f}", flush=True)
                             else:
@@ -1325,15 +1337,23 @@ class Validator(BaseValidatorNeuron):
                     submission_id = submission.get("id")
                     if submission_id:
                         try:
+                            fail_payload = {
+                                "submission_id": submission_id,
+                                "score": 0.0,
+                            }
                             response = requests.post(
                                 f"{VALIDATOR_API_URL}/mark_validated_with_verification",
-                                json={
-                                    "submission_id": submission_id,
-                                    "score": 0.0,
-                                },
+                                json=fail_payload,
                                 headers=self._api_auth_headers(),
                                 timeout=30
                             )
+                            if response.status_code == 404:
+                                response = requests.post(
+                                    f"{VALIDATOR_API_URL}/mark_validated",
+                                    json=fail_payload,
+                                    headers=self._api_auth_headers(),
+                                    timeout=30
+                                )
                             if response.status_code == 200:
                                 print(f"[VALIDATOR] ✅ Submission {submission_id} marked as validated with score 0.0", flush=True)
                             else:

@@ -1480,14 +1480,10 @@ def mark_validated(
         print(f"ℹ️ [MARK_VALIDATED] Submission {submission_id} already validated (score={submission.score}), skipping")
         return {"status": "already_validated", "submission_id": submission_id, "score": submission.score}
 
-    submission.validated = True
-
-    # Update score if provided (clamp to [0.0, 1.0])
+    # Validate inputs before mutating
     score = req.get("score")
     if score is not None:
         score = max(0.0, min(1.0, float(score)))
-        submission.score = score
-        print(f"📊 [MARK_VALIDATED] Submission {submission_id}: score={score:.4f}")
 
     actual_tps = req.get("actual_tokens_per_sec")
     if actual_tps is not None:
@@ -1495,9 +1491,18 @@ def mark_validated(
         if actual_tps < MIN_PLAUSIBLE_TPS or actual_tps > MAX_PLAUSIBLE_TPS:
             raise HTTPException(
                 status_code=400,
-                detail=f"actual_tokens_per_sec={actual_tps:.2f} is outside plausible range "
+                detail=f"actual_tokens_per_sec={actual_tps:.2f} is outside plausible range. "
                        f"Rejected."
             )
+
+    # All inputs valid — mutate
+    submission.validated = True
+
+    if score is not None:
+        submission.score = score
+        print(f"📊 [MARK_VALIDATED] Submission {submission_id}: score={score:.4f}")
+
+    if actual_tps is not None:
         old_tps = submission.tokens_per_sec
         submission.validated_tokens_per_sec = actual_tps
     
@@ -1649,13 +1654,10 @@ def mark_validated_with_verification(
             "verified": submission.logit_verification_passed,
         }
 
-    # --- Validation phase (mark_validated fields) ---
-    submission.validated = True
-
+    # --- Input validation (before any mutations) ---
     score = req.get("score")
     if score is not None:
         score = max(0.0, min(1.0, float(score)))
-        submission.score = score
 
     actual_tps = req.get("actual_tokens_per_sec")
     if actual_tps is not None:
@@ -1665,6 +1667,32 @@ def mark_validated_with_verification(
                 status_code=400,
                 detail=f"actual_tokens_per_sec={actual_tps:.2f} outside plausible range."
             )
+
+    verified = req.get("verified")
+    cos_sim = req.get("cosine_similarity")
+    if cos_sim is not None:
+        cos_sim = float(cos_sim)
+        if cos_sim < 0.0 or cos_sim > 1.0:
+            raise HTTPException(status_code=400, detail=f"cosine_similarity must be in [0.0, 1.0], got {cos_sim}")
+    max_diff = req.get("max_abs_diff")
+    if max_diff is not None:
+        max_diff = float(max_diff)
+        if max_diff < 0.0:
+            raise HTTPException(status_code=400, detail=f"max_abs_diff must be >= 0, got {max_diff}")
+    throughput = req.get("throughput")
+    if throughput is not None:
+        throughput = float(throughput)
+        if throughput < 0 or throughput > MAX_PLAUSIBLE_TPS:
+            raise HTTPException(status_code=400, detail=f"throughput={throughput} outside plausible range")
+    reason = req.get("reason")
+
+    # --- All inputs valid, now mutate ---
+    submission.validated = True
+
+    if score is not None:
+        submission.score = score
+
+    if actual_tps is not None:
         old_tps = submission.tokens_per_sec
         submission.validated_tokens_per_sec = actual_tps
 
@@ -1690,36 +1718,16 @@ def mark_validated_with_verification(
                         f"(diff: {discrepancy_pct:.1f}%, abs: {discrepancy_abs:.0f})"
                     )
 
-    # --- Verification phase (record_verification fields) ---
-    verified = req.get("verified")
     if verified is not None:
         submission.logit_verification_passed = bool(verified)
-
-        cos_sim = req.get("cosine_similarity")
         if cos_sim is not None:
-            cos_sim = float(cos_sim)
-            if cos_sim < 0.0 or cos_sim > 1.0:
-                raise HTTPException(status_code=400, detail=f"cosine_similarity must be in [0.0, 1.0], got {cos_sim}")
             submission.cosine_similarity = cos_sim
-
-        max_diff = req.get("max_abs_diff")
         if max_diff is not None:
-            max_diff = float(max_diff)
-            if max_diff < 0.0:
-                raise HTTPException(status_code=400, detail=f"max_abs_diff must be >= 0, got {max_diff}")
             submission.max_abs_diff = max_diff
-
-        throughput = req.get("throughput")
         if throughput is not None:
-            throughput = float(throughput)
-            if throughput < 0 or throughput > MAX_PLAUSIBLE_TPS:
-                raise HTTPException(status_code=400, detail=f"throughput={throughput} outside plausible range")
             submission.throughput_verified = throughput
-
-        reason = req.get("reason")
         if reason is not None:
             submission.verification_reason = str(reason)
-
         v_status = "PASSED" if verified else "FAILED"
         print(f"🔍 [VERIFY] Submission {submission_id}: {v_status}")
 
@@ -2158,7 +2166,12 @@ def get_weights(
             models.MinerRegistration.network == round_obj.network
         ).first()
         uid = miner_reg.uid if miner_reg and miner_reg.uid > 0 else -1
-        
+
+        # Skip miners with unresolved UIDs — cannot emit on-chain weights
+        if uid <= 0:
+            print(f"  ⚠️ Skipping {ranking['miner_hotkey'][:12]}...: unresolved UID ({uid})")
+            continue
+
         tokens_per_sec = ranking.get("tokens_per_sec")
         github_username = None
         sub = db.query(models.SpeedSubmission).filter(
@@ -2166,7 +2179,7 @@ def get_weights(
         ).first()
         if sub and sub.fork_url:
             github_username = _github_username_from_fork_url(sub.fork_url)
-        
+
         weights.append(WeightEntry(
             uid=uid,
             hotkey=ranking["miner_hotkey"],
