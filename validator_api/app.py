@@ -659,11 +659,11 @@ def submit_kernel(
             miner_reg = models.MinerRegistration(
                 hotkey=hotkey,
                 network=network,
-                uid=0
+                uid=-1  # Sentinel: unknown UID, must be resolved from metagraph
             )
             db.add(miner_reg)
             db.commit()
-            print(f"✅ [SUBMIT_KERNEL] Auto-registered miner {hotkey[:8]}... on {network} (UID will be synced from metagraph)")
+            print(f"⚠️ [SUBMIT_KERNEL] Auto-registered miner {hotkey[:8]}... on {network} with uid=-1 (must be resolved from metagraph)")
 
         client_ip = get_client_ip(request)
         
@@ -1215,7 +1215,14 @@ def record_verification(
     
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
-    
+
+    # Guard: unrevealed submissions must not be verified
+    if not submission.is_revealed:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Submission {submission_id} has not been revealed yet"
+        )
+
     # Validate cosine_similarity range [0.0, 1.0]
     if cosine_similarity is not None and (cosine_similarity < 0.0 or cosine_similarity > 1.0):
         raise HTTPException(status_code=400, detail=f"cosine_similarity must be in [0.0, 1.0], got {cosine_similarity}")
@@ -1461,8 +1468,20 @@ def mark_validated(
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
 
+    # Guard: unrevealed submissions must not be validated
+    if not submission.is_revealed:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Submission {submission_id} has not been revealed yet"
+        )
+
+    # Guard: already validated — return current state without overwriting
+    if submission.validated:
+        print(f"ℹ️ [MARK_VALIDATED] Submission {submission_id} already validated (score={submission.score}), skipping")
+        return {"status": "already_validated", "submission_id": submission_id, "score": submission.score}
+
     submission.validated = True
-    
+
     # Update score if provided (clamp to [0.0, 1.0])
     score = req.get("score")
     if score is not None:
@@ -1482,8 +1501,8 @@ def mark_validated(
         old_tps = submission.tokens_per_sec
         submission.validated_tokens_per_sec = actual_tps
     
-        if old_tps and actual_tps > 0:
-            discrepancy_pct = abs(old_tps - actual_tps) / max(old_tps, 1) * 100
+        if old_tps is not None and actual_tps > 0:
+            discrepancy_pct = abs(old_tps - actual_tps) / max(old_tps, actual_tps) * 100
             discrepancy_abs = abs(old_tps - actual_tps)
             
             # Server-side thresholds (miners cannot bypass)
@@ -1558,7 +1577,7 @@ def mark_validated(
                     registration = models.MinerRegistration(
                         hotkey=submission.miner_hotkey,
                         network=sub_network,
-                        uid=submission.miner_uid or 0
+                        uid=submission.miner_uid if submission.miner_uid and submission.miner_uid > 0 else -1
                     )
                     db.add(registration)
                 
@@ -1585,6 +1604,175 @@ def mark_validated(
         record_success(submission.ip_address, db)
 
     return {"status": "ok", "submission_id": submission_id, "score": submission.score}
+
+
+@app.post("/mark_validated_with_verification")
+def mark_validated_with_verification(
+    req: dict,
+    db: Session = Depends(get_db),
+    hotkey: str = Depends(auth.verify_validator_signature)
+):
+    """
+    Atomically mark a submission as validated AND record verification result
+    in a single transaction. Prevents inconsistent state where one succeeds
+    and the other fails.
+
+    Accepts all fields from both /mark_validated and /record_verification:
+      - submission_id (required)
+      - score, actual_tokens_per_sec (from mark_validated)
+      - verified, cosine_similarity, max_abs_diff, throughput, reason (from record_verification)
+    """
+    submission_id = req.get("submission_id")
+    if not submission_id:
+        raise HTTPException(status_code=400, detail="submission_id required")
+
+    submission = db.query(models.SpeedSubmission).filter(
+        models.SpeedSubmission.id == submission_id
+    ).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    # Guard: unrevealed submissions must not be validated
+    if not submission.is_revealed:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Submission {submission_id} has not been revealed yet"
+        )
+
+    # Guard: already validated — return current state
+    if submission.validated:
+        print(f"ℹ️ [ATOMIC] Submission {submission_id} already validated, skipping")
+        return {
+            "status": "already_validated",
+            "submission_id": submission_id,
+            "score": submission.score,
+            "verified": submission.logit_verification_passed,
+        }
+
+    # --- Validation phase (mark_validated fields) ---
+    submission.validated = True
+
+    score = req.get("score")
+    if score is not None:
+        score = max(0.0, min(1.0, float(score)))
+        submission.score = score
+
+    actual_tps = req.get("actual_tokens_per_sec")
+    if actual_tps is not None:
+        actual_tps = float(actual_tps)
+        if actual_tps < MIN_PLAUSIBLE_TPS or actual_tps > MAX_PLAUSIBLE_TPS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"actual_tokens_per_sec={actual_tps:.2f} outside plausible range."
+            )
+        old_tps = submission.tokens_per_sec
+        submission.validated_tokens_per_sec = actual_tps
+
+        if old_tps is not None and actual_tps > 0:
+            discrepancy_pct = abs(old_tps - actual_tps) / max(old_tps, actual_tps) * 100
+            discrepancy_abs = abs(old_tps - actual_tps)
+
+            DISCREPANCY_PCT_THRESHOLD = float(os.environ.get("DISCREPANCY_PCT_THRESHOLD", "50.0"))
+            DISCREPANCY_ABS_THRESHOLD = float(os.environ.get("DISCREPANCY_ABS_THRESHOLD", "1000.0"))
+
+            if (discrepancy_pct > DISCREPANCY_PCT_THRESHOLD and
+                    discrepancy_abs > DISCREPANCY_ABS_THRESHOLD):
+                print(f"🚨 [MARK_VALIDATED] TPS MISMATCH for {submission.miner_hotkey[:12]}...: "
+                      f"claimed={old_tps:.2f}, actual={actual_tps:.2f}")
+                miner_reg = db.query(models.MinerRegistration).filter(
+                    models.MinerRegistration.hotkey == submission.miner_hotkey,
+                    models.MinerRegistration.network == (getattr(submission, "network", None) or DEFAULT_NETWORK)
+                ).first()
+                if miner_reg and not miner_reg.is_flagged:
+                    miner_reg.is_flagged = True
+                    miner_reg.flag_reason = (
+                        f"Large TPS discrepancy: claimed {old_tps:.0f}, actual {actual_tps:.0f} "
+                        f"(diff: {discrepancy_pct:.1f}%, abs: {discrepancy_abs:.0f})"
+                    )
+
+    # --- Verification phase (record_verification fields) ---
+    verified = req.get("verified")
+    if verified is not None:
+        submission.logit_verification_passed = bool(verified)
+
+        cos_sim = req.get("cosine_similarity")
+        if cos_sim is not None:
+            cos_sim = float(cos_sim)
+            if cos_sim < 0.0 or cos_sim > 1.0:
+                raise HTTPException(status_code=400, detail=f"cosine_similarity must be in [0.0, 1.0], got {cos_sim}")
+            submission.cosine_similarity = cos_sim
+
+        max_diff = req.get("max_abs_diff")
+        if max_diff is not None:
+            max_diff = float(max_diff)
+            if max_diff < 0.0:
+                raise HTTPException(status_code=400, detail=f"max_abs_diff must be >= 0, got {max_diff}")
+            submission.max_abs_diff = max_diff
+
+        throughput = req.get("throughput")
+        if throughput is not None:
+            throughput = float(throughput)
+            if throughput < 0 or throughput > MAX_PLAUSIBLE_TPS:
+                raise HTTPException(status_code=400, detail=f"throughput={throughput} outside plausible range")
+            submission.throughput_verified = throughput
+
+        reason = req.get("reason")
+        if reason is not None:
+            submission.verification_reason = str(reason)
+
+        v_status = "PASSED" if verified else "FAILED"
+        print(f"🔍 [VERIFY] Submission {submission_id}: {v_status}")
+
+    # --- Single atomic commit ---
+    db.commit()
+
+    # Aggregate scores (same as mark_validated)
+    if score is not None and submission.miner_hotkey:
+        try:
+            league = get_league_for_seq_len(submission.target_sequence_length)
+            sub_network = getattr(submission, "network", None) or DEFAULT_NETWORK
+            miner_score = db.query(models.MinerScore).filter(
+                models.MinerScore.hotkey == submission.miner_hotkey,
+                models.MinerScore.league == league,
+                models.MinerScore.network == sub_network,
+            ).first()
+            if miner_score:
+                alpha = 0.3
+                miner_score.score = max(0.0, min(1.0, alpha * float(score) + (1 - alpha) * miner_score.score))
+                miner_score.tasks_completed += 1
+                miner_score.last_updated = datetime.utcnow()
+            else:
+                registration = db.query(models.MinerRegistration).filter(
+                    models.MinerRegistration.hotkey == submission.miner_hotkey,
+                    models.MinerRegistration.network == sub_network,
+                ).first()
+                model_name = "quasar-kernel"
+                miner_score = models.MinerScore(
+                    hotkey=submission.miner_hotkey,
+                    model_name=model_name,
+                    league=league,
+                    network=sub_network,
+                    score=float(score),
+                    tasks_completed=1
+                )
+                db.add(miner_score)
+            db.commit()
+        except Exception as e:
+            print(f"⚠️ [MINER_SCORES] Failed to update miner_scores: {e}")
+            db.rollback()
+
+    if submission.ip_address:
+        record_success(submission.ip_address, db)
+
+    print(f"📊 [ATOMIC] Submission {submission_id}: score={submission.score}, "
+          f"verified={submission.logit_verification_passed}, tps={submission.validated_tokens_per_sec}")
+    return {
+        "status": "ok",
+        "submission_id": submission_id,
+        "score": submission.score,
+        "verified": submission.logit_verification_passed,
+    }
+
 
 @app.post("/record_failure")
 def record_failure_endpoint(
@@ -1669,10 +1857,11 @@ def register_miner(
             db.add(new_registration)
             db.commit()
             print(f"✅ [REGISTER] Created missing MinerRegistration for {hotkey[:8]} on {network} with UID={miner_uid}")
-        elif registration.uid == 0 and miner_uid > 0:
+        elif registration.uid <= 0 and miner_uid > 0:
+            old_uid = registration.uid
             registration.uid = miner_uid
             db.commit()
-            print(f"✅ [REGISTER] Updated UID for {hotkey[:8]} on {network}: 0 -> {miner_uid}")
+            print(f"✅ [REGISTER] Updated UID for {hotkey[:8]} on {network}: {old_uid} -> {miner_uid}")
 
         print(f"ℹ️ [REGISTER] Miner {hotkey[:8]} already registered for {req.model_name} in {req.league} on {network}")
         return {
@@ -1968,7 +2157,7 @@ def get_weights(
             models.MinerRegistration.hotkey == ranking["miner_hotkey"],
             models.MinerRegistration.network == round_obj.network
         ).first()
-        uid = miner_reg.uid if miner_reg else 0
+        uid = miner_reg.uid if miner_reg and miner_reg.uid > 0 else -1
         
         tokens_per_sec = ranking.get("tokens_per_sec")
         github_username = None
@@ -2076,7 +2265,24 @@ def ensure_current_round(db, network: Optional[str] = None):
             status="active"
         )
         db.add(current_round)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Another process created the round concurrently — use theirs.
+            db.rollback()
+            current_round = (
+                db.query(models.CompetitionRound)
+                .filter(models.CompetitionRound.network == network)
+                .filter(models.CompetitionRound.status == "active")
+                .order_by(models.CompetitionRound.round_number.desc())
+                .first()
+            )
+            if not current_round:
+                raise RuntimeError(
+                    f"Failed to create or find active round for network={network}"
+                )
+            print(f"🔄 [ROUND] Concurrent round creation detected, using existing round #{current_round.round_number}")
+            return current_round
         db.refresh(current_round)
         print(f"✅ [ROUND] Created new round #{current_round.round_number} for network={network}")
     return current_round

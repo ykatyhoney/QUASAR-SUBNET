@@ -1238,59 +1238,71 @@ class Validator(BaseValidatorNeuron):
                     # LOGIT VERIFICATION (from const's qllm architecture)
                     # Run after performance test passes to verify miner is running actual model
                     # ═══════════════════════════════════════════════════════════════════════
-                    if self.logit_verification_enabled and submission_id:
+                    if not submission.get("is_revealed", True):
+                        print(f"[VALIDATOR] ⏳ Submission {submission_id} not yet revealed, skipping verification", flush=True)
+                        evaluated_scores[miner_hotkey] = 0.0
+                        normalized_score = 0.0
+                    elif self.logit_verification_enabled and submission_id:
                         print(f"[VALIDATOR] 🔍 Running logit verification...", flush=True)
                         docker_image = submission.get("docker_image")
-                        # Get fork_url and commit_hash from submission or result
                         fork_url = submission.get("fork_url") or result.get("fork_url")
                         commit_hash = submission.get("commit_hash") or result.get("commit_hash")
-                        # Note: repo_path is not available here (already cleaned up)
-                        # Context will be built from fork_url + commit_hash
                         verification_result = self.run_logit_verification(
                             submission_id=submission_id,
                             docker_image=docker_image,
-                            repo_path=None,  # Will clone if needed
+                            repo_path=None,
                             fork_url=fork_url,
                             commit_hash=commit_hash
                         )
-                        
-                        # Record verification result to API
-                        self.record_verification_result(submission_id, verification_result)
-                        
-                        # Logit verification is mandatory: only True passes
+
                         if verification_result.get("verified") == True:
                             evaluated_scores[miner_hotkey] = normalized_score
                         else:
-                            status = "FAILED" if verification_result.get("verified") == False else "NOT RUN"
-                            print(f"[VALIDATOR] ❌ Logit verification {status} - score set to 0", flush=True)
+                            v_status = "FAILED" if verification_result.get("verified") == False else "NOT RUN"
+                            print(f"[VALIDATOR] ❌ Logit verification {v_status} - score set to 0", flush=True)
                             normalized_score = 0.0
                             evaluated_scores[miner_hotkey] = 0.0
                     else:
+                        verification_result = None
                         evaluated_scores[miner_hotkey] = normalized_score
-                    
-                    # Mark submission as validated in API and record score
-                    # Send the validator-measured actual_tokens_per_sec so rankings
-                    # use the real value, not the miner-claimed one.
+
+                    # Atomically mark validated + record verification in one API call
                     actual_tps = result.get("actual_performance", 0.0)
                     if submission_id:
                         try:
-                            mark_payload = {
+                            payload = {
                                 "submission_id": submission_id,
                                 "score": normalized_score,
                                 "actual_tokens_per_sec": actual_tps,
                             }
+                            # Include verification fields if available
+                            if verification_result is not None:
+                                verified = verification_result.get("verified")
+                                if verified is None:
+                                    verified = False
+                                payload["verified"] = bool(verified)
+                                if verification_result.get("cosine_similarity") is not None:
+                                    payload["cosine_similarity"] = verification_result["cosine_similarity"]
+                                if verification_result.get("max_abs_diff") is not None:
+                                    payload["max_abs_diff"] = verification_result["max_abs_diff"]
+                                tp = verification_result.get("throughput_verified") or verification_result.get("reference_throughput")
+                                if tp is not None:
+                                    payload["throughput"] = tp
+                                if verification_result.get("reason"):
+                                    payload["reason"] = verification_result["reason"]
+
                             response = requests.post(
-                                f"{VALIDATOR_API_URL}/mark_validated",
-                                json=mark_payload,
+                                f"{VALIDATOR_API_URL}/mark_validated_with_verification",
+                                json=payload,
                                 headers=self._api_auth_headers(),
                                 timeout=30
                             )
                             if response.status_code == 200:
                                 print(f"[VALIDATOR] ✅ Submission {submission_id} marked validated: score={normalized_score:.4f}, actual_tps={actual_tps:.2f}", flush=True)
                             else:
-                                print(f"[VALIDATOR] ⚠️ Failed to mark submission as validated: {response.status_code} - {response.text}", flush=True)
+                                print(f"[VALIDATOR] ⚠️ Failed to mark submission: {response.status_code} - {response.text}", flush=True)
                         except Exception as e:
-                            print(f"[VALIDATOR] Failed to mark submission as validated: {e}", flush=True)
+                            print(f"[VALIDATOR] Failed to mark submission: {e}", flush=True)
                 else:
                     print(f"[VALIDATOR] ❌ Invalid submission from {miner_hotkey[:12]}...", flush=True)
                     evaluated_scores[miner_hotkey] = 0.0
@@ -1314,10 +1326,10 @@ class Validator(BaseValidatorNeuron):
                     if submission_id:
                         try:
                             response = requests.post(
-                                f"{VALIDATOR_API_URL}/mark_validated",
+                                f"{VALIDATOR_API_URL}/mark_validated_with_verification",
                                 json={
                                     "submission_id": submission_id,
-                                    "score": 0.0
+                                    "score": 0.0,
                                 },
                                 headers=self._api_auth_headers(),
                                 timeout=30
