@@ -294,24 +294,16 @@ class PerformanceValidator:
                 headers=headers,
                 timeout=30,
             )
-            response.raise_for_status()
+            if response.status_code != 200:
+                detail = response.text[:500]
+                print(f"[VALIDATOR] Error fetching pending submissions: "
+                      f"status {response.status_code}, detail: {detail}")
+                return []
             data = response.json()
             return data.get("submissions", [])
         except Exception as e:
             print(f"[VALIDATOR] Error fetching pending submissions: {e}")
-            # Fallback to public endpoint (fork_url will be hidden)
-            try:
-                response = requests.get(
-                    f"{self.validator_api_url}/get_submission_stats",
-                    params={"limit": limit},
-                    timeout=30,
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data.get("recent_submissions", [])
-            except Exception as e2:
-                print(f"[VALIDATOR] Fallback also failed: {e2}")
-                return []
+            return []
 
     def clone_miner_repo(self, fork_url: str) -> str:
         """Clone miner's fork repository to temporary directory."""
