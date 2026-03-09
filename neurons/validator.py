@@ -69,6 +69,23 @@ class PerformanceValidator:
         "import fla.ops.kda",
     ]
 
+    # Dangerous built-ins / modules that must never appear in miner code.
+    # Checked via AST so dynamic tricks (string concat, getattr) in source
+    # are caught at the call-site level.
+    DANGEROUS_CALLS = {
+        "__import__", "exec", "eval", "compile",
+        "os.system", "os.popen", "os.exec",
+        "os.execl", "os.execle", "os.execlp", "os.execlpe",
+        "os.execv", "os.execve", "os.execvp", "os.execvpe",
+        "os.spawn", "os.spawnl", "os.spawnle",
+        "subprocess.run", "subprocess.call", "subprocess.Popen",
+        "subprocess.check_output", "subprocess.check_call",
+    }
+    DANGEROUS_IMPORT_MODULES = {
+        "importlib", "ctypes", "socket", "http",
+        "urllib", "requests", "paramiko", "fabric",
+    }
+
     def __init__(self, validator_instance=None):
         """
         Initialize PerformanceValidator.
@@ -82,12 +99,95 @@ class PerformanceValidator:
         self.validator_instance = validator_instance  # Reference to main Validator for logit verification
         print(f"[VALIDATOR] Initialized with temp dir: {self.temp_dir}")
 
-    def validate_imports(self, repo_path: str) -> tuple[bool, List[str]]:
-        """Validate that files have required imports and no forbidden imports."""
-        quasar_dir = os.path.join(repo_path, "fla/ops/quasar")
-        target_files = ["chunk.py", "chunk_intra_token_parallel.py", "forward_substitution.py", "fused_recurrent.py", "gate.py"]
+    # --- AST helpers -----------------------------------------------------------
 
-        errors = []
+    @staticmethod
+    def _ast_imported_names(tree) -> set:
+        """Return all imported module/name strings from an AST tree."""
+        import ast
+        names: set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                names.add(module)
+                for alias in node.names:
+                    names.add(f"{module}.{alias.name}" if module else alias.name)
+        return names
+
+    @staticmethod
+    def _ast_called_names(tree) -> set:
+        """Return dotted call-names (e.g. 'os.system') found in the AST."""
+        import ast
+        calls: set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                parts = []
+                while isinstance(func, ast.Attribute):
+                    parts.append(func.attr)
+                    func = func.value
+                if isinstance(func, ast.Name):
+                    parts.append(func.id)
+                if parts:
+                    parts.reverse()
+                    calls.add(".".join(parts))
+        return calls
+
+    # --- Main validation entry point -----------------------------------------
+
+    def validate_imports(self, repo_path: str) -> tuple[bool, List[str]]:
+        """Validate miner repo using AST parsing.
+
+        1. Scan .py files under fla/ for dangerous calls / imports.
+        2. Check the 5 target files exist with required/forbidden imports.
+        """
+        import ast
+        import glob as _glob
+
+        errors: List[str] = []
+
+        # --- Phase 1: deep-scan .py files under fla/ for dangerous patterns ---
+        # Scoped to fla/ to avoid false positives from the base repo's own
+        # setup.py, tests/, benchmarks/, etc. which legitimately use os/subprocess.
+        fla_root = os.path.join(repo_path, "fla")
+        all_py = _glob.glob(os.path.join(fla_root, "**", "*.py"), recursive=True) if os.path.isdir(fla_root) else []
+        for py_path in all_py:
+            rel = os.path.relpath(py_path, repo_path)
+            try:
+                with open(py_path, "r", encoding="utf-8") as f:
+                    source = f.read()
+                tree = ast.parse(source, filename=rel)
+            except SyntaxError:
+                errors.append(f"{rel}: SyntaxError - file cannot be parsed")
+                continue
+
+            # Dangerous calls
+            called = self._ast_called_names(tree)
+            for dc in self.DANGEROUS_CALLS:
+                if dc in called:
+                    errors.append(f"{rel}: Dangerous call detected: {dc}()")
+
+            # Dangerous module imports
+            imported = self._ast_imported_names(tree)
+            for mod in self.DANGEROUS_IMPORT_MODULES:
+                for imp in imported:
+                    if imp == mod or imp.startswith(f"{mod}."):
+                        errors.append(
+                            f"{rel}: Dangerous module imported: {imp}"
+                        )
+
+        # --- Phase 2: target-file checks (required + forbidden imports) ------
+        quasar_dir = os.path.join(repo_path, "fla/ops/quasar")
+        target_files = [
+            "chunk.py",
+            "chunk_intra_token_parallel.py",
+            "forward_substitution.py",
+            "fused_recurrent.py",
+            "gate.py",
+        ]
 
         for filename in target_files:
             file_path = os.path.join(quasar_dir, filename)
@@ -95,90 +195,34 @@ class PerformanceValidator:
                 errors.append(f"Missing file: {filename}")
                 continue
 
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    source = f.read()
+                tree = ast.parse(source, filename=filename)
+            except SyntaxError:
+                errors.append(f"{filename}: SyntaxError - cannot parse")
+                continue
 
-            # Check for forbidden imports
+            imported = self._ast_imported_names(tree)
+
+            # Forbidden imports (AST-level)
             for forbidden in self.FORBIDDEN_IMPORTS:
-                if forbidden in content:
-                    errors.append(f"{filename}: Forbidden import found: {forbidden}")
+                mod = forbidden.replace("from ", "").replace("import ", "").strip()
+                for imp in imported:
+                    if imp == mod or imp.startswith(f"{mod}."):
+                        errors.append(
+                            f"{filename}: Forbidden import found: {forbidden}"
+                        )
 
-            # Check for required imports (only for chunk.py - these are CRITICAL)
+            # Required imports (only for chunk.py)
             if filename == "chunk.py":
                 for required in self.REQUIRED_IMPORTS_CHUNK_PY:
-                    # Extract the import name (e.g., "autocast_custom_bwd" from "from fla.utils import autocast_custom_bwd")
                     import_name = required.split("import")[-1].strip()
-                    found = False
-                    
-                    # Normalize content for comparison (remove comments, normalize whitespace)
-                    normalized_content = content
-                    # Remove single-line comments
-                    lines = normalized_content.split('\n')
-                    cleaned_lines = []
-                    for line in lines:
-                        # Remove comments but keep the line structure
-                        if '#' in line:
-                            comment_pos = line.find('#')
-                            # Check if # is in a string
-                            if line[:comment_pos].count('"') % 2 == 0 and line[:comment_pos].count("'") % 2 == 0:
-                                line = line[:comment_pos]
-                        cleaned_lines.append(line)
-                    normalized_content = '\n'.join(cleaned_lines)
-                    
-                    # Check exact match first
-                    if required in normalized_content:
-                        found = True
-                    # Check case-insensitive match
-                    elif required.lower() in normalized_content.lower():
-                        found = True
-                    # Check for multi-line imports: from fla.utils import (\n    autocast_custom_bwd,\n    ...)
-                    elif f"from fla.utils import" in normalized_content.lower():
-                        # Find all import lines and continuation lines
-                        import_blocks = []
-                        lines = normalized_content.split('\n')
-                        in_import_block = False
-                        current_block = []
-                        
-                        for i, line in enumerate(lines):
-                            line_lower = line.lower().strip()
-                            if 'from fla.utils import' in line_lower:
-                                in_import_block = True
-                                current_block = [line]
-                                # Check if it's a single-line import
-                                if ')' not in line and '(' not in line:
-                                    import_blocks.append(line)
-                                    in_import_block = False
-                                    current_block = []
-                            elif in_import_block:
-                                current_block.append(line)
-                                if ')' in line or (line.strip().endswith(',') and i < len(lines) - 1 and 'from' in lines[i+1].lower()):
-                                    import_blocks.append('\n'.join(current_block))
-                                    in_import_block = False
-                                    current_block = []
-                        
-                        # Check if import_name appears in any import block
-                        for block in import_blocks:
-                            if import_name.lower() in block.lower():
-                                found = True
-                                break
-                    
-                    # Final check: simple string search for the import name near "from fla.utils"
-                    if not found:
-                        # Look for the import name anywhere in the file (as a fallback)
-                        # This handles cases where imports might be reformatted
-                        import_patterns = [
-                            f"from fla.utils import {import_name}",
-                            f"from fla.utils import ({import_name}",
-                            f"{import_name},",
-                            f"{import_name})",
-                        ]
-                        for pattern in import_patterns:
-                            if pattern.lower() in normalized_content.lower():
-                                found = True
-                                break
-                    
-                    if not found:
-                        errors.append(f"{filename}: Missing required import: {required}")
+                    expected = f"fla.utils.{import_name}"
+                    if expected not in imported:
+                        errors.append(
+                            f"{filename}: Missing required import: {required}"
+                        )
 
         return len(errors) == 0, errors
     
@@ -276,23 +320,25 @@ class PerformanceValidator:
                 timeout=60,
             )
 
-    def run_performance_test(self, repo_path: str, sequence_length: int) -> Dict[str, float]:
-        """Run performance test on cloned repository.
+    # Docker image used to sandbox miner code execution.
+    # Must have Python, PyTorch, Triton, and fla base dependencies installed.
+    SANDBOX_IMAGE = os.getenv(
+        "VALIDATOR_SANDBOX_IMAGE",
+        "quasar-miner-gpu:latest",
+    )
+    # Hard resource limits for the sandbox container.
+    SANDBOX_MEMORY_LIMIT = os.getenv("SANDBOX_MEMORY_LIMIT", "16g")
+    try:
+        SANDBOX_TIMEOUT = int(os.getenv("SANDBOX_TIMEOUT", "300"))
+    except (TypeError, ValueError):
+        SANDBOX_TIMEOUT = 300
 
-        Returns:
-            Dict with keys: tokens_per_sec, vram_mb
-        """
-        print(f"[VALIDATOR] Running performance test (seq_len={sequence_length})...")
-        
-        # Create temporary test script with target sequence length
-        temp_test_script = os.path.join(repo_path, f"test_temp_{sequence_length}.py")
-        with open(temp_test_script, 'w') as f:
-            f.write(f"""
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    def _build_test_script(self, sequence_length: int) -> str:
+        """Return the Python source for the benchmark test script."""
+        return f"""
+import sys, os, time, json
+sys.path.insert(0, "/workspace")
 
-# Enable verbose logging for Triton kernel compilation
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 os.environ["TRITON_PRINT_DEBUG"] = "1"
 
@@ -301,13 +347,12 @@ from fla.layers.quasar import QuasarAttention
 
 def test_quasar():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     batch_size = 1
     seq_len = {sequence_length}
     hidden_size = 512
     head_dim = 64
     num_heads = 8
-    
+
     quasar = QuasarAttention(
         hidden_size=hidden_size,
         head_dim=head_dim,
@@ -315,32 +360,25 @@ def test_quasar():
         mode="chunk",
         use_short_conv=True,
     ).to(device)
-    
+
     x = torch.randn(batch_size, seq_len, hidden_size, device=device)
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
-    
-    # Warmup
+
     for _ in range(3):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else torch.no_grad():
             _ = quasar(x)
-    
     if device.type == "cuda":
         torch.cuda.synchronize()
-    
-    # Benchmark
-    import time
+
     num_runs = 10
     start = time.time()
-    
     for _ in range(num_runs):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else torch.no_grad():
             _ = quasar(x)
-    
     if device.type == "cuda":
         torch.cuda.synchronize()
-    
     elapsed = time.time() - start
     tokens_per_sec = (batch_size * seq_len * num_runs) / elapsed
 
@@ -348,52 +386,180 @@ def test_quasar():
     if device.type == "cuda":
         vram_bytes = torch.cuda.max_memory_allocated()
     vram_mb = vram_bytes / (1024 * 1024)
-    
+
     print(f"RESULT: {{tokens_per_sec:.2f}}")
     print(f"VRAM_MB: {{vram_mb:.2f}}")
-    return tokens_per_sec
 
 if __name__ == "__main__":
-    tps = test_quasar()
-    print(f"Tokens/sec: {{tps:.2f}}")
-""")
-        
+    test_quasar()
+"""
+
+    def run_performance_test(
+        self, repo_path: str, sequence_length: int
+    ) -> Dict[str, float]:
+        """Run performance test inside a sandboxed Docker container.
+
+        The miner's cloned repo is mounted **read-only** into the container.
+        The container runs with:
+          - --network none   (no network access)
+          - --cap-drop ALL   (drop all Linux capabilities)
+          - --read-only      (read-only root filesystem)
+          - --security-opt no-new-privileges
+          - bounded memory and timeout
+
+        Returns:
+            Dict with keys: tokens_per_sec, vram_mb
+        """
+        print(
+            f"[VALIDATOR] Running sandboxed performance test "
+            f"(seq_len={sequence_length})..."
+        )
+
+        # Write the test script into the repo dir (it will be mounted r/o
+        # inside the container, so we write it on the host side first).
+        test_script_name = f"test_temp_{sequence_length}.py"
+        temp_test_script = os.path.join(repo_path, test_script_name)
+
         try:
-            result = subprocess.run(
-                [sys.executable, temp_test_script],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
-            
-            output = result.stdout + result.stderr
-            
-            tokens_per_sec = 0.0
-            vram_mb = 0.0
-            for line in output.split('\n'):
-                if "RESULT:" in line:
-                    tokens_per_sec = float(line.split("RESULT:")[1].strip())
-                if "VRAM_MB:" in line:
-                    vram_mb = float(line.split("VRAM_MB:")[1].strip())
-            
-            if tokens_per_sec > 0:
-                print(f"[VALIDATOR] Test result: {tokens_per_sec:.2f} tokens/sec | VRAM: {vram_mb:.2f} MB")
-                return {"tokens_per_sec": tokens_per_sec, "vram_mb": vram_mb}
-            
-            print(f"[VALIDATOR] Could not parse test results: {output}")
-            return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
-            
-        except subprocess.TimeoutExpired:
-            print(f"[VALIDATOR] Test timed out (300s)")
-            return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+            with open(temp_test_script, "w") as f:
+                f.write(self._build_test_script(sequence_length))
+
+            # --- Docker SDK sandbox execution --------------------------------
+            try:
+                import docker as _docker
+            except ImportError:
+                return self._run_performance_fallback(
+                    repo_path, temp_test_script
+                )
+
+            client = _docker.from_env()
+
+            run_kwargs = {
+                "image": self.SANDBOX_IMAGE,
+                "command": [
+                    "python3", f"/workspace/{test_script_name}"
+                ],
+                "detach": True,
+                "auto_remove": False,
+                # Mount miner repo read-only
+                "volumes": {
+                    os.path.abspath(repo_path): {
+                        "bind": "/workspace",
+                        "mode": "ro",
+                    }
+                },
+                # --- Security hardening ---
+                "network_mode": "none",
+                "cap_drop": ["ALL"],
+                "read_only": True,
+                "security_opt": ["no-new-privileges"],
+                "mem_limit": self.SANDBOX_MEMORY_LIMIT,
+                "pids_limit": 512,
+                # Writable dirs -- Triton compiles .so kernels at runtime
+                # so /tmp and the cache dir must allow execution.
+                "tmpfs": {
+                    "/tmp": "size=2G",
+                    "/root/.triton": "size=1G",
+                },
+                "environment": {
+                    "TRITON_CACHE_DIR": "/root/.triton",
+                },
+                "labels": {"quasar.role": "perf-sandbox"},
+            }
+
+            # GPU is required for meaningful benchmarks.
+            try:
+                run_kwargs["device_requests"] = [
+                    _docker.types.DeviceRequest(
+                        count=1, capabilities=[["gpu"]]
+                    )
+                ]
+            except Exception as gpu_err:
+                print(
+                    f"[VALIDATOR] CRITICAL: Cannot configure GPU for "
+                    f"sandbox container: {gpu_err}. "
+                    f"CPU-only benchmarks are not comparable -- aborting."
+                )
+                return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+
+            container = None
+            try:
+                container = client.containers.run(**run_kwargs)
+                result = container.wait(timeout=self.SANDBOX_TIMEOUT)
+                output = container.logs().decode(errors="replace")
+            except Exception as e:
+                print(f"[VALIDATOR] Sandbox container error: {e}")
+                return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+            finally:
+                if container is not None:
+                    try:
+                        container.stop(timeout=5)
+                    except Exception:
+                        pass
+                    try:
+                        container.remove(force=True)
+                    except Exception:
+                        pass
+
+            return self._parse_test_output(output)
+
         except Exception as e:
             print(f"[VALIDATOR] Test failed: {e}")
             return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
         finally:
-            # Clean up temp test script
             if os.path.exists(temp_test_script):
                 os.remove(temp_test_script)
+
+    @staticmethod
+    def _run_performance_fallback(
+        repo_path: str, test_script: str
+    ) -> Dict[str, float]:
+        """Refuse to run when Docker is unavailable.
+
+        Running miner-controlled code without a container sandbox exposes
+        the validator to RCE.  Return zero so the submission is scored as
+        invalid rather than risk host compromise.
+        """
+        print(
+            "[VALIDATOR] CRITICAL: Docker SDK not available. "
+            "Refusing to execute miner code without sandbox. "
+            "Install the 'docker' Python package and ensure Docker "
+            "daemon is running."
+        )
+        return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+
+    @staticmethod
+    def _parse_test_output(output: str) -> Dict[str, float]:
+        """Parse RESULT: / VRAM_MB: lines from test script stdout."""
+        tokens_per_sec = 0.0
+        vram_mb = 0.0
+        for line in output.split("\n"):
+            if "RESULT:" in line:
+                try:
+                    tokens_per_sec = float(
+                        line.split("RESULT:")[1].strip()
+                    )
+                except ValueError:
+                    pass
+            if "VRAM_MB:" in line:
+                try:
+                    vram_mb = float(
+                        line.split("VRAM_MB:")[1].strip()
+                    )
+                except ValueError:
+                    pass
+
+        if tokens_per_sec > 0:
+            print(
+                f"[VALIDATOR] Test result: {tokens_per_sec:.2f} "
+                f"tokens/sec | VRAM: {vram_mb:.2f} MB"
+            )
+        else:
+            print(
+                f"[VALIDATOR] Could not parse test results from output "
+                f"({len(output)} bytes)"
+            )
+        return {"tokens_per_sec": tokens_per_sec, "vram_mb": vram_mb}
     
     def verify_performance(self, claimed: float, actual: float, tolerance: float = 0.1) -> bool:
         """Verify if actual performance is close to claimed performance."""
