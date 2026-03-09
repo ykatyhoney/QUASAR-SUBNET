@@ -553,15 +553,18 @@ if __name__ == "__main__":
                 result = container.wait(timeout=self.SANDBOX_TIMEOUT)
                 output = container.logs().decode(errors="replace")
             except Exception as e:
-                err_str = str(e)
+                err_str = str(e).lower()
                 print(f"[VALIDATOR] Sandbox container error: {e}")
-                # Image pull failures and Docker errors are infra issues,
-                # not miner code faults — mark for retry.
-                if "pull access denied" in err_str or "not found" in err_str.lower() or "404" in err_str:
-                    print(f"[VALIDATOR] Sandbox image '{self.SANDBOX_IMAGE}' not available. "
-                          f"Build it with: cd miner && docker build -f Dockerfile.inference -t {self.SANDBOX_IMAGE} .")
+                # Image pull / not-found errors are infra issues — mark for retry
+                if "pull access denied" in err_str or "not found" in err_str or "404" in err_str:
+                    print(
+                        f"[VALIDATOR] Sandbox image '{self.SANDBOX_IMAGE}' not available. "
+                        f"Build it with: cd miner && docker build -f Dockerfile.inference "
+                        f"-t {self.SANDBOX_IMAGE} ."
+                    )
                     return {"tokens_per_sec": 0.0, "vram_mb": 0.0, "infra_failure": True}
-                return {"tokens_per_sec": 0.0, "vram_mb": 0.0, "infra_failure": True}
+                # Other container errors (OOM, timeout, etc.) are miner faults
+                return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
             finally:
                 if container is not None:
                     try:
@@ -576,8 +579,8 @@ if __name__ == "__main__":
             return self._parse_test_output(output)
 
         except Exception as e:
-            print(f"[VALIDATOR] Test failed: {e}")
-            return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
+            print(f"[VALIDATOR] Test setup failed: {e}")
+            return {"tokens_per_sec": 0.0, "vram_mb": 0.0, "infra_failure": True}
         finally:
             if os.path.exists(temp_test_script):
                 os.remove(temp_test_script)
