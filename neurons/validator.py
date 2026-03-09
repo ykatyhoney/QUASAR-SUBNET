@@ -368,9 +368,11 @@ class PerformanceValidator:
 
     # Docker image used to sandbox miner code execution.
     # Must have Python, PyTorch, Triton, and fla base dependencies installed.
+    # Build it once on your validator machine:
+    #   docker build -t quasar-sandbox:latest -f validator/Dockerfile.sandbox .
     SANDBOX_IMAGE = os.getenv(
         "VALIDATOR_SANDBOX_IMAGE",
-        "quasar-miner-gpu:latest",
+        "quasar-sandbox:latest",
     )
     # Hard resource limits for the sandbox container.
     SANDBOX_MEMORY_LIMIT = os.getenv("SANDBOX_MEMORY_LIMIT", "16g")
