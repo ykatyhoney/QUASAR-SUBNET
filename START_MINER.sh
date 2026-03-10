@@ -1,6 +1,11 @@
 #!/bin/bash
 # Script to start the Miner
 # Run from project root
+#
+# Prerequisites:
+#   - GITHUB_TOKEN and GITHUB_USERNAME set in .env
+#   - DOCKER_USERNAME set in .env (for logit verification)
+#   - Docker image pushed to Docker Hub
 
 cd "$(dirname "$0")"
 
@@ -43,9 +48,6 @@ export MINER_MODEL_NAME=${MINER_MODEL_NAME:-"Qwen/Qwen3-4B-Instruct-2507"}
 export USE_FULL_CONTEXT=${USE_FULL_CONTEXT:-"true"}
 export CONTEXT_MAX_FILES=${CONTEXT_MAX_FILES:-50}
 export CONTEXT_MAX_SIZE=${CONTEXT_MAX_SIZE:-200000}
-# Optional: BYOC mode (commented by default)
-# export REPO_PATH=${REPO_PATH:-""}
-# export BYOC_FILE_PATH=${BYOC_FILE_PATH:-""}
 
 # Check required environment variables
 if [ -z "$GITHUB_TOKEN" ]; then
@@ -62,6 +64,12 @@ if [ -z "$GITHUB_USERNAME" ]; then
     exit 1
 fi
 
+# Docker image info
+DOCKER_IMAGE="${MINER_DOCKER_IMAGE:-}"
+if [ -z "$DOCKER_IMAGE" ] && [ -n "$DOCKER_USERNAME" ]; then
+    DOCKER_IMAGE="${DOCKER_USERNAME}/quasar-miner-gpu:latest"
+fi
+
 echo "Configuration:"
 echo "  API URL: $VALIDATOR_API_URL"
 echo "  NetUID: $NETUID"
@@ -75,10 +83,19 @@ echo "  Target Seq Length: $TARGET_SEQUENCE_LENGTH"
 echo "  Agent Iterations: $AGENT_ITERATIONS"
 echo "  Optimization Interval: $OPTIMIZATION_INTERVAL seconds"
 echo ""
+echo "Docker Image (for logit verification):"
+if [ -n "$DOCKER_IMAGE" ]; then
+    echo "  ✅ $DOCKER_IMAGE"
+else
+    echo "  ⚠️  Not configured! Set DOCKER_USERNAME in .env"
+    echo "     Without this, logit verification will FAIL."
+    echo "     Build & push: cd docker-build && bash push_miner.sh"
+fi
+echo ""
 echo "Model Configuration:"
 echo "  Model: $MINER_MODEL_NAME"
 echo ""
-echo "Context Builder (Phase 2: Full Repository Context):"
+echo "Context Builder:"
 echo "  Use Full Context: $USE_FULL_CONTEXT"
 echo "  Max Files: $CONTEXT_MAX_FILES"
 echo "  Max Size: $CONTEXT_MAX_SIZE chars (~$((CONTEXT_MAX_SIZE / 4))K tokens)"

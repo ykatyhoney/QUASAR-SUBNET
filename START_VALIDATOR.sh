@@ -1,6 +1,10 @@
 #!/bin/bash
 # Script to start the Validator Neuron
 # Run from project root
+#
+# Prerequisites:
+#   - Docker with NVIDIA Container Toolkit
+#   - Sandbox image built: docker build -t quasar-sandbox:latest -f validator/Dockerfile.sandbox .
 
 cd "$(dirname "$0")"
 
@@ -40,6 +44,9 @@ export REFERENCE_MODEL=${REFERENCE_MODEL:-"Qwen/Qwen3-4B-Instruct-2507"}
 export COSINE_SIM_THRESHOLD=${COSINE_SIM_THRESHOLD:-0.99}
 export MAX_ABS_DIFF_THRESHOLD=${MAX_ABS_DIFF_THRESHOLD:-0.1}
 
+# Sandbox settings
+export VALIDATOR_SANDBOX_IMAGE=${VALIDATOR_SANDBOX_IMAGE:-"quasar-sandbox:latest"}
+
 # Commit-reveal settings
 export BLOCKS_UNTIL_REVEAL=${BLOCKS_UNTIL_REVEAL:-100}
 export BLOCK_TIME_SECONDS=${BLOCK_TIME_SECONDS:-12}
@@ -59,18 +66,49 @@ echo "  Enabled: $ENABLE_LOGIT_VERIFICATION"
 echo "  Reference Model: $REFERENCE_MODEL"
 echo "  Cosine Similarity Threshold: $COSINE_SIM_THRESHOLD"
 echo "  Max Absolute Difference: $MAX_ABS_DIFF_THRESHOLD"
-echo "  Context-Aware: ✅ (builds repository context for consistency)"
 echo ""
-echo "Commit-Reveal:"
-echo "  Blocks Until Reveal: $BLOCKS_UNTIL_REVEAL (~$((BLOCKS_UNTIL_REVEAL * BLOCK_TIME_SECONDS / 60)) minutes)"
+echo "Sandbox:"
+echo "  Image: $VALIDATOR_SANDBOX_IMAGE"
 echo ""
 
+# --- Pre-flight checks ---
+
+# Check Docker daemon
+echo "Checking Docker..."
+if docker info > /dev/null 2>&1; then
+    echo "✅ Docker daemon is running"
+else
+    echo "❌ Docker daemon is not running!"
+    echo "   Validators require Docker for sandboxed testing and logit verification."
+    echo "   If on RunPod: validators cannot run on RunPod (no Docker support)."
+    echo "   See TROUBLESHOOTING.md for details."
+    exit 1
+fi
+
+# Check sandbox image exists
+if docker image inspect "$VALIDATOR_SANDBOX_IMAGE" > /dev/null 2>&1; then
+    echo "✅ Sandbox image '$VALIDATOR_SANDBOX_IMAGE' found"
+else
+    echo "❌ Sandbox image '$VALIDATOR_SANDBOX_IMAGE' not found!"
+    echo "   Build it with: docker build -t quasar-sandbox:latest -f validator/Dockerfile.sandbox ."
+    exit 1
+fi
+
+# Check GPU in Docker
+if docker run --rm --gpus all nvidia/cuda:12.1.0-runtime-ubuntu22.04 nvidia-smi > /dev/null 2>&1; then
+    echo "✅ GPU passthrough in Docker is working"
+else
+    echo "⚠️  GPU passthrough in Docker may not be configured."
+    echo "   Install NVIDIA Container Toolkit — see TROUBLESHOOTING.md"
+fi
+
 # Check if API is running
+echo ""
 echo "Checking validator API..."
 if curl -s "$VALIDATOR_API_URL/health" > /dev/null 2>&1; then
     echo "✅ Validator API is running"
 else
-    echo "❌ Validator API is not running!"
+    echo "❌ Validator API is not running at $VALIDATOR_API_URL!"
     echo "   Please check Validator API is running and try again."
     exit 1
 fi

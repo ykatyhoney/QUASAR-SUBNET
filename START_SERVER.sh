@@ -14,9 +14,9 @@ echo ""
 # Activate virtual environment if it exists
 if [ -d ".venv" ]; then
     source .venv/bin/activate
-    echo "Activated virtual environment"
+    echo "✅ Activated virtual environment"
 else
-    echo "Virtual environment not found. Create it with: python3 -m venv .venv"
+    echo "❌ Virtual environment not found. Create it with: python3 -m venv .venv"
     exit 1
 fi
 
@@ -25,9 +25,9 @@ if [ -f .env ]; then
     set -a
     source .env
     set +a
-    echo "Loaded .env file"
+    echo "✅ Loaded .env file"
 else
-    echo "No .env file found. Using defaults."
+    echo "⚠️  No .env file found. Using defaults."
 fi
 
 # Set defaults if not in .env (mainnet defaults)
@@ -68,6 +68,18 @@ if [[ "$DATABASE_URL" == sqlite* ]]; then
     echo "  Database: SQLite (${DATABASE_URL#sqlite:///})"
 else
     echo "  Database: PostgreSQL"
+fi
+
+# Show auth config
+if [ -n "$VALIDATOR_HOTKEYS" ]; then
+    HOTKEY_COUNT=$(echo "$VALIDATOR_HOTKEYS" | tr ',' '\n' | grep -c '[^[:space:]]')
+    echo "  Authorized Validators: $HOTKEY_COUNT hotkey(s)"
+else
+    echo "  ⚠️  VALIDATOR_HOTKEYS not set — validator endpoints will reject all requests"
+fi
+
+if [ -n "$API_KEYS" ]; then
+    echo "  API Keys: configured"
 fi
 echo ""
 

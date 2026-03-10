@@ -169,7 +169,7 @@ testing/
 
 
 # .md files
-*.md
+# *.md
 
 # .db files
 *.db
