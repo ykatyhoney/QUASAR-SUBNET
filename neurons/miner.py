@@ -4,6 +4,7 @@
 import os
 import time
 import typing
+import re
 import requests
 import hashlib
 import subprocess
@@ -806,9 +807,6 @@ class Miner(BaseMinerNeuron):
                 "network": network,
             }
             
-            headers = self._get_auth_headers()
-            headers["Content-Type"] = "application/json"
-            
             bt.logging.info(f"Submitting to validator: {performance:.2f} tokens/sec")
             print(f"[API] Submitting to validator: {performance:.2f} tokens/sec", flush=True)
 
@@ -834,6 +832,7 @@ class Miner(BaseMinerNeuron):
                     print(f"[API] Response status: {response.status_code}", flush=True)
                     print(f"[API] Response text: {response.text[:500]}", flush=True)
 
+                    # Validation errors won't fix on retry — fail immediately
                     if response.status_code == 422:
                         detail = response.json().get("detail", response.text[:500])
                         raise ValueError(f"Validation error from /submit_kernel: {detail}")
@@ -842,8 +841,7 @@ class Miner(BaseMinerNeuron):
                     if response.status_code == 429:
                         try:
                             detail = response.json().get("detail", "")
-                            import re as _re
-                            match = _re.search(r"wait (\d+) seconds", detail)
+                            match = re.search(r"wait (\d+) seconds", detail)
                             wait = int(match.group(1)) + 5 if match else 30
                         except Exception:
                             wait = 30
