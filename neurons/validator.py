@@ -549,8 +549,12 @@ if __name__ == "__main__":
             except Exception as e:
                 err_str = str(e).lower()
                 print(f"[VALIDATOR] Sandbox container error: {e}")
-                # Image pull / not-found errors are infra issues — mark for retry
-                if "pull access denied" in err_str or "not found" in err_str or "404" in err_str:
+                # Infra errors — mark for retry (not the miner's fault)
+                if ("pull access denied" in err_str
+                        or "not found" in err_str
+                        or "404" in err_str
+                        or "gpu vendor" in err_str
+                        or "nvidia" in err_str):
                     print(
                         f"[VALIDATOR] Sandbox image '{self.SANDBOX_IMAGE}' not available. "
                         f"Build it with: cd miner && docker build -f Dockerfile.inference "
