@@ -515,8 +515,8 @@ if __name__ == "__main__":
                 # Writable dirs -- Triton compiles .so kernels at runtime
                 # so /tmp and the cache dir must allow execution.
                 "tmpfs": {
-                    "/tmp": "size=2G",
-                    "/root/.triton": "size=1G",
+                    "/tmp": "exec,size=2G",
+                    "/root/.triton": "exec,size=1G",
                 },
                 "environment": {
                     "TRITON_CACHE_DIR": "/root/.triton",
