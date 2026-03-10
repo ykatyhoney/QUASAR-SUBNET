@@ -557,8 +557,8 @@ if __name__ == "__main__":
                         or "nvidia" in err_str):
                     print(
                         f"[VALIDATOR] Sandbox image '{self.SANDBOX_IMAGE}' not available. "
-                        f"Build it with: cd miner && docker build -f Dockerfile.inference "
-                        f"-t {self.SANDBOX_IMAGE} ."
+                        f"Build it with: docker build -t {self.SANDBOX_IMAGE} "
+                        f"-f validator/Dockerfile.sandbox ."
                     )
                     return {"tokens_per_sec": 0.0, "vram_mb": 0.0, "infra_failure": True}
                 # Other container errors (OOM, timeout, etc.) are miner faults
