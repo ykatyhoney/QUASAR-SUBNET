@@ -4,6 +4,7 @@
 import os
 import time
 import typing
+import re
 import requests
 import hashlib
 import subprocess
@@ -806,15 +807,17 @@ class Miner(BaseMinerNeuron):
                 "network": network,
             }
             
-            headers = self._get_auth_headers()
-            headers["Content-Type"] = "application/json"
-            
             bt.logging.info(f"Submitting to validator: {performance:.2f} tokens/sec")
             print(f"[API] Submitting to validator: {performance:.2f} tokens/sec", flush=True)
 
             last_err: Optional[Exception] = None
             for attempt in range(3):
                 try:
+                    # Regenerate auth headers each attempt so the
+                    # timestamp/signature stays fresh.
+                    headers = self._get_auth_headers()
+                    headers["Content-Type"] = "application/json"
+
                     response = self._api_request(
                         "POST",
                         "/submit_kernel",
@@ -829,9 +832,22 @@ class Miner(BaseMinerNeuron):
                     print(f"[API] Response status: {response.status_code}", flush=True)
                     print(f"[API] Response text: {response.text[:500]}", flush=True)
 
+                    # Validation errors won't fix on retry — fail immediately
                     if response.status_code == 422:
                         detail = response.json().get("detail", response.text[:500])
                         raise ValueError(f"Validation error from /submit_kernel: {detail}")
+
+                    # Rate limited — parse wait time and sleep
+                    if response.status_code == 429:
+                        try:
+                            detail = response.json().get("detail", "")
+                            match = re.search(r"wait (\d+) seconds", detail)
+                            wait = int(match.group(1)) + 5 if match else 30
+                        except Exception:
+                            wait = 30
+                        print(f"[API] Rate limited, waiting {wait}s before retry...", flush=True)
+                        time.sleep(wait)
+                        continue
 
                     response.raise_for_status()
                     result = response.json()
@@ -842,7 +858,7 @@ class Miner(BaseMinerNeuron):
                     last_err = e
                     bt.logging.warning(f"Submission attempt {attempt + 1}/3 failed: {e}")
                     print(f"[API] Submission attempt {attempt + 1}/3 failed: {e}", flush=True)
-                    time.sleep(2 * (attempt + 1))
+                    time.sleep(10)
 
             if last_err is not None:
                 raise last_err
