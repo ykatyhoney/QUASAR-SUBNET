@@ -378,14 +378,44 @@ class PerformanceValidator:
     def _build_test_script(self, sequence_length: int) -> str:
         """Return the Python source for the benchmark test script."""
         return f"""
-import sys, os, time, json
+import sys, os, time, json, types
 sys.path.insert(0, "/workspace")
 
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 os.environ["TRITON_PRINT_DEBUG"] = "1"
 
 import torch
-from fla.layers.quasar import QuasarAttention
+
+# Stub broken upstream fla modules before importing QuasarAttention.
+# Some fla versions reference ops that don't exist in the cloned repo,
+# causing an ImportError cascade.  We catch, purge partial state, stub
+# the missing symbol, and retry.
+def _import_quasar_attention():
+    try:
+        from fla.layers.quasar import QuasarAttention
+        return QuasarAttention
+    except ImportError as exc:
+        err = str(exc)
+        missing_name = None
+        stub_target = None
+        if "cannot import name" in err:
+            parts = err.split("'")
+            if len(parts) >= 2:
+                missing_name = parts[1]
+        if "from '" in err:
+            stub_target = err.split("from '")[1].split("'")[0]
+        for key in list(sys.modules):
+            if key == "fla" or key.startswith("fla."):
+                del sys.modules[key]
+        if stub_target:
+            stub = types.ModuleType(stub_target)
+            if missing_name:
+                setattr(stub, missing_name, None)
+            sys.modules[stub_target] = stub
+        from fla.layers.quasar import QuasarAttention
+        return QuasarAttention
+
+QuasarAttention = _import_quasar_attention()
 
 def test_quasar():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

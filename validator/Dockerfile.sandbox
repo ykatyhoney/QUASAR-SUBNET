@@ -2,10 +2,15 @@
 # Contains Python, PyTorch (CUDA), Triton, and flash-linear-attention (fla).
 # Miner code is mounted read-only at /workspace at runtime.
 #
-# Build:
+# Build (default uses CUDA 12.8 for Blackwell/sm_120 support):
 #   docker build -t quasar-sandbox:latest -f validator/Dockerfile.sandbox .
 #
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+# Build with specific CUDA version:
+#   docker build --build-arg CUDA_VERSION=12.4.1 --build-arg TORCH_CUDA=cu124 \
+#     -t quasar-sandbox:latest -f validator/Dockerfile.sandbox .
+#
+ARG CUDA_VERSION=12.8.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,9 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.11 /usr/bin/python
 
-# Install PyTorch with CUDA support (default pip installs CPU-only)
+# Install PyTorch with CUDA support.
+# cu128 supports sm_120 (Blackwell/RTX 5090); use cu124 for older GPUs.
+ARG TORCH_CUDA=cu128
 RUN python3 -m pip install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cu124
+    torch --index-url https://download.pytorch.org/whl/${TORCH_CUDA}
 
 RUN python3 -m pip install --no-cache-dir \
     triton>=2.1.0 \
