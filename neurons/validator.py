@@ -296,8 +296,10 @@ class PerformanceValidator:
             )
             if response.status_code != 200:
                 detail = response.text[:500]
-                print(f"[VALIDATOR] Error fetching pending submissions: "
-                      f"status {response.status_code}, detail: {detail}")
+                print(
+                    f"[VALIDATOR] Error fetching pending submissions: "
+                    f"status {response.status_code}, detail: {detail}"
+                )
                 return []
             data = response.json()
             return data.get("submissions", [])
@@ -550,17 +552,23 @@ if __name__ == "__main__":
                 err_str = str(e).lower()
                 print(f"[VALIDATOR] Sandbox container error: {e}")
                 # Infra errors — mark for retry (not the miner's fault)
-                if ("pull access denied" in err_str
-                        or "not found" in err_str
-                        or "404" in err_str
-                        or "gpu vendor" in err_str
-                        or "nvidia" in err_str):
+                if (
+                    "pull access denied" in err_str
+                    or "not found" in err_str
+                    or "404" in err_str
+                    or "gpu vendor" in err_str
+                    or "nvidia" in err_str
+                ):
                     print(
                         f"[VALIDATOR] Sandbox image '{self.SANDBOX_IMAGE}' not available. "
                         f"Build it with: docker build -t {self.SANDBOX_IMAGE} "
                         f"-f validator/Dockerfile.sandbox ."
                     )
-                    return {"tokens_per_sec": 0.0, "vram_mb": 0.0, "infra_failure": True}
+                    return {
+                        "tokens_per_sec": 0.0,
+                        "vram_mb": 0.0,
+                        "infra_failure": True,
+                    }
                 # Other container errors (OOM, timeout, etc.) are miner faults
                 return {"tokens_per_sec": 0.0, "vram_mb": 0.0}
             finally:
@@ -578,7 +586,11 @@ if __name__ == "__main__":
 
         except Exception as e:
             print(f"[VALIDATOR] Test setup failed: {e}")
-            return {"tokens_per_sec": 0.0, "vram_mb": 0.0, "infra_failure": True}
+            return {
+                "tokens_per_sec": 0.0,
+                "vram_mb": 0.0,
+                "infra_failure": True,
+            }
         finally:
             if os.path.exists(temp_test_script):
                 os.remove(temp_test_script)
@@ -659,11 +671,34 @@ if __name__ == "__main__":
         repo_hash = submission.get(
             "repo_hash"
         )  # Repository context hash from miner
-        claimed_performance = submission.get("tokens_per_sec")
+        raw_performance = submission.get("tokens_per_sec")
         target_sequence_length = submission.get(
             "target_sequence_length", 100000
         )
         claimed_benchmarks_json = submission.get("benchmarks")
+
+        # Guard: claimed_performance must be a positive number
+        try:
+            claimed_performance = (
+                float(raw_performance) if raw_performance is not None else None
+            )
+        except (TypeError, ValueError):
+            claimed_performance = None
+        if not claimed_performance or claimed_performance <= 0:
+            print(
+                f"[VALIDATOR] ❌ Submission {submission.get('id')}: "
+                f"invalid claimed_performance={claimed_performance}"
+            )
+            return {
+                "submission_id": submission.get("id"),
+                "miner_hotkey": submission.get("miner_hotkey"),
+                "claimed_performance": claimed_performance,
+                "actual_performance": 0.0,
+                "score": 0.0,
+                "is_valid": False,
+                "errors": ["claimed_performance is None or <= 0"],
+                "reason": "Invalid claimed performance",
+            }
 
         # Parse claimed benchmarks if available
         claimed_benchmarks = {}
@@ -774,10 +809,18 @@ if __name__ == "__main__":
             # Compare all reported sequence lengths
             print(f"[VALIDATOR] Benchmark comparison:")
             for seq_len in (
-                sorted(int(k) for k in claimed_benchmarks.keys()) if claimed_benchmarks else []
+                sorted(int(k) for k in claimed_benchmarks.keys())
+                if claimed_benchmarks
+                else []
             ):
-                claimed = claimed_benchmarks.get(str(seq_len), claimed_benchmarks.get(seq_len, {}))
-                claimed = claimed.get("tokens_per_sec", 0) if isinstance(claimed, dict) else 0
+                claimed = claimed_benchmarks.get(
+                    str(seq_len), claimed_benchmarks.get(seq_len, {})
+                )
+                claimed = (
+                    claimed.get("tokens_per_sec", 0)
+                    if isinstance(claimed, dict)
+                    else 0
+                )
                 actual = results_by_seq_len.get(seq_len, {}).get(
                     "tokens_per_sec", 0
                 )
@@ -1176,7 +1219,7 @@ class Validator(BaseValidatorNeuron):
                 return {
                     "verified": False,
                     "reason": "No docker_image provided. Miner must set DOCKER_USERNAME and push "
-                              "their inference container (see Dockerfile.inference).",
+                    "their inference container (see Dockerfile.inference).",
                     "repo_hash": repo_hash,
                 }
 
@@ -1531,9 +1574,9 @@ class Validator(BaseValidatorNeuron):
                         f"{submission.get('id')} — will retry later",
                         flush=True,
                     )
-                    break
+                    continue
 
-                miner_hotkey = result.get("miner_hotkey")
+                miner_hotkey = result.get("miner_hotkey") or "unknown"
                 score = result.get("score", 0.0)
 
                 # Use the score from validate_submission (already calculated)
@@ -1575,11 +1618,6 @@ class Validator(BaseValidatorNeuron):
                             commit_hash=commit_hash,
                         )
 
-                        # Record verification result to API
-                        self.record_verification_result(
-                            submission_id, verification_result
-                        )
-
                         # Logit verification is mandatory: only True passes
                         if verification_result.get("verified") == True:
                             evaluated_scores[miner_hotkey] = normalized_score
@@ -1616,15 +1654,35 @@ class Validator(BaseValidatorNeuron):
                                 if verified is None:
                                     verified = False
                                 payload["verified"] = bool(verified)
-                                if verification_result.get("cosine_similarity") is not None:
-                                    payload["cosine_similarity"] = verification_result["cosine_similarity"]
-                                if verification_result.get("max_abs_diff") is not None:
-                                    payload["max_abs_diff"] = verification_result["max_abs_diff"]
-                                tp = verification_result.get("miner_throughput") or verification_result.get("reference_throughput")
+                                if (
+                                    verification_result.get(
+                                        "cosine_similarity"
+                                    )
+                                    is not None
+                                ):
+                                    payload["cosine_similarity"] = (
+                                        verification_result[
+                                            "cosine_similarity"
+                                        ]
+                                    )
+                                if (
+                                    verification_result.get("max_abs_diff")
+                                    is not None
+                                ):
+                                    payload["max_abs_diff"] = (
+                                        verification_result["max_abs_diff"]
+                                    )
+                                tp = verification_result.get(
+                                    "miner_throughput"
+                                ) or verification_result.get(
+                                    "reference_throughput"
+                                )
                                 if tp is not None:
                                     payload["throughput"] = tp
                                 if verification_result.get("reason"):
-                                    payload["reason"] = verification_result["reason"]
+                                    payload["reason"] = verification_result[
+                                        "reason"
+                                    ]
 
                             response = requests.post(
                                 f"{VALIDATOR_API_URL}/mark_validated_with_verification",
@@ -1638,10 +1696,12 @@ class Validator(BaseValidatorNeuron):
                                     f"{VALIDATOR_API_URL}/mark_validated",
                                     json=payload,
                                     headers=self._api_auth_headers(),
-                                    timeout=30
+                                    timeout=30,
                                 )
                                 if verification_result is not None:
-                                    self.record_verification_result(submission_id, verification_result)
+                                    self.record_verification_result(
+                                        submission_id, verification_result
+                                    )
                             if response.status_code == 200:
                                 print(
                                     f"[VALIDATOR] ✅ Submission {submission_id} marked validated: score={normalized_score:.4f}, actual_tps={actual_tps:.2f}",
@@ -1706,7 +1766,7 @@ class Validator(BaseValidatorNeuron):
                                     f"{VALIDATOR_API_URL}/mark_validated",
                                     json=fail_payload,
                                     headers=self._api_auth_headers(),
-                                    timeout=30
+                                    timeout=30,
                                 )
                             if response.status_code == 200:
                                 print(
