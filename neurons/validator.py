@@ -624,6 +624,9 @@ if __name__ == "__main__":
                 f"[VALIDATOR] Could not parse test results from output "
                 f"({len(output)} bytes)"
             )
+            tail = output[-1500:] if len(output) > 1500 else output
+            for line in tail.strip().split("\n"):
+                print(f"[VALIDATOR]   | {line}")
         return {"tokens_per_sec": tokens_per_sec, "vram_mb": vram_mb}
 
     def verify_performance(
