@@ -1,5 +1,5 @@
 # Sandbox image for validator performance testing.
-# Contains Python, PyTorch, Triton, and flash-linear-attention (fla).
+# Contains Python, PyTorch (CUDA), Triton, and flash-linear-attention (fla).
 # Miner code is mounted read-only at /workspace at runtime.
 #
 # Build:
@@ -18,9 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.11 /usr/bin/python
 
+# Install PyTorch with CUDA support (default pip installs CPU-only)
 RUN python3 -m pip install --no-cache-dir \
-    torch>=2.0.0 \
+    torch --index-url https://download.pytorch.org/whl/cu124
+
+RUN python3 -m pip install --no-cache-dir \
     triton>=2.1.0 \
+    causal-conv1d>=1.4.0 \
     flash-linear-attention \
     numpy>=1.24.0
 
