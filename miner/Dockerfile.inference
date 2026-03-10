@@ -14,7 +14,7 @@
 #   GET /health    - Health check
 #   GET /model_info - Model information
 
-FROM nvidia/cuda:12.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
