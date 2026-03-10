@@ -3,18 +3,22 @@
 # This Dockerfile creates a container that implements the inference
 # interface required by the QUASAR inference verification subnet.
 #
-# Build:
-#   docker build -f Dockerfile.inference -t quasar-miner:latest .
+# Build (auto-detects CUDA version):
+#   docker build -f Dockerfile.inference -t quasar-miner-gpu:latest .
+#
+# Build with specific CUDA version:
+#   docker build -f Dockerfile.inference --build-arg CUDA_VERSION=12.4.0 -t quasar-miner-gpu:latest .
 #
 # Run:
-#   docker run -p 8000:8000 --gpus all quasar-miner:latest
+#   docker run -p 8000:8000 --gpus all quasar-miner-gpu:latest
 #
 # The container exposes:
 #   POST /inference - Run inference with logit capture
 #   GET /health    - Health check
 #   GET /model_info - Model information
 
-FROM nvidia/cuda:12.1-runtime-ubuntu22.04
+ARG CUDA_VERSION=12.2.0
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
