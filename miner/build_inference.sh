@@ -14,7 +14,6 @@ if [ -n "$1" ]; then
 elif [ -z "$CUDA_VERSION" ]; then
     # Auto-detect from nvidia-smi
     if command -v nvidia-smi &>/dev/null; then
-        RAW=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
         CUDA_VERSION=$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[\d.]+' | head -1)
         if [ -n "$CUDA_VERSION" ]; then
             # nvidia-smi reports major.minor (e.g. 12.2), append .0
@@ -22,8 +21,12 @@ elif [ -z "$CUDA_VERSION" ]; then
                 *.*.* ) ;; # already has patch
                 *     ) CUDA_VERSION="${CUDA_VERSION}.0" ;;
             esac
-            echo "Detected CUDA $CUDA_VERSION from nvidia-smi"
+            echo "✅ Detected CUDA $CUDA_VERSION from nvidia-smi"
+        else
+            echo "⚠️  nvidia-smi found but could not parse CUDA version, using default"
         fi
+    else
+        echo "⚠️  nvidia-smi not found, using default CUDA version"
     fi
 fi
 
