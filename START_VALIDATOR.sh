@@ -47,6 +47,13 @@ export MAX_ABS_DIFF_THRESHOLD=${MAX_ABS_DIFF_THRESHOLD:-0.1}
 # Sandbox settings
 export VALIDATOR_SANDBOX_IMAGE=${VALIDATOR_SANDBOX_IMAGE:-"quasar-sandbox:latest"}
 
+# GPU normalization — adjusts measured TPS to a reference GPU baseline.
+# Set GPU_NORMALIZATION_FACTOR to override auto-detection (e.g. "1.10" for RTX 6000 Pro).
+# Or set GPU_NORMALIZATION_FACTORS as JSON to add custom GPU entries:
+#   GPU_NORMALIZATION_FACTORS='{"My Custom GPU": 0.85}'
+export GPU_NORMALIZATION_FACTOR=${GPU_NORMALIZATION_FACTOR:-""}
+export GPU_NORMALIZATION_FACTORS=${GPU_NORMALIZATION_FACTORS:-""}
+
 # Commit-reveal settings
 export BLOCKS_UNTIL_REVEAL=${BLOCKS_UNTIL_REVEAL:-100}
 export BLOCK_TIME_SECONDS=${BLOCK_TIME_SECONDS:-12}
@@ -69,6 +76,13 @@ echo "  Max Absolute Difference: $MAX_ABS_DIFF_THRESHOLD"
 echo ""
 echo "Sandbox:"
 echo "  Image: $VALIDATOR_SANDBOX_IMAGE"
+echo ""
+echo "GPU Normalization:"
+if [ -n "$GPU_NORMALIZATION_FACTOR" ]; then
+    echo "  Manual override: $GPU_NORMALIZATION_FACTOR"
+else
+    echo "  Auto-detect (set GPU_NORMALIZATION_FACTOR to override)"
+fi
 echo ""
 
 # --- Pre-flight checks ---

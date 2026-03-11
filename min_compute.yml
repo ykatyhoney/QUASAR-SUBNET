@@ -22,12 +22,12 @@ compute_spec:
 
     gpu:
       required: True                       # Does the application require a GPU?
-      min_vram: 8                          # Minimum GPU VRAM (GB)
-      recommended_vram: 24                 # Recommended GPU VRAM (GB)
-      cuda_cores: 1024                     # Minimum number of CUDA cores (if applicable)
-      min_compute_capability: 6.0          # Minimum CUDA compute capability
-      recommended_compute_capability: 7.0  # Recommended CUDA compute capability
-      recommended_gpu: "NVIDIA A100"       # provide a recommended GPU to purchase/rent
+      min_vram: 16                         # Minimum GPU VRAM (GB)
+      recommended_vram: 32                 # Recommended GPU VRAM (GB)
+      cuda_cores: 8192                     # Minimum number of CUDA cores (if applicable)
+      min_compute_capability: 8.0          # Minimum CUDA compute capability (Ampere+)
+      recommended_compute_capability: 12.0 # Recommended CUDA compute capability (Blackwell)
+      recommended_gpu: "NVIDIA GeForce RTX 5090"  # Reference GPU for the subnet
 
     memory:
       min_ram: 16          # Minimum RAM (GB)
@@ -57,12 +57,12 @@ compute_spec:
 
     gpu:
       required: True                       # Does the application require a GPU?
-      min_vram: 8                          # Minimum GPU VRAM (GB)
-      recommended_vram: 24                 # Recommended GPU VRAM (GB)
-      cuda_cores: 1024                     # Minimum number of CUDA cores (if applicable)
-      min_compute_capability: 6.0          # Minimum CUDA compute capability
-      recommended_compute_capability: 7.0  # Recommended CUDA compute capability
-      recommended_gpu: "NVIDIA A100"       # provide a recommended GPU to purchase/rent
+      min_vram: 24                         # Minimum GPU VRAM (GB)
+      recommended_vram: 48                 # Recommended GPU VRAM (GB) — for ref model + sandbox
+      cuda_cores: 8192                     # Minimum number of CUDA cores (if applicable)
+      min_compute_capability: 8.0          # Minimum CUDA compute capability (Ampere+)
+      recommended_compute_capability: 12.0 # Recommended CUDA compute capability (Blackwell)
+      recommended_gpu: "NVIDIA RTX 6000 Pro"  # 48GB VRAM, Blackwell; or RTX 5090
 
     memory:
       min_ram: 16          # Minimum RAM (GB)

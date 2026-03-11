@@ -1,8 +1,10 @@
 # Sandbox image for validator performance testing.
-# Contains Python, PyTorch (CUDA), Triton, and flash-linear-attention (fla).
+# Contains Python, PyTorch (CUDA 12.8), Triton, and flash-linear-attention (fla).
 # Miner code is mounted read-only at /workspace at runtime.
 #
-# Build (default uses CUDA 12.8 for Blackwell/sm_120 support):
+# Supports GPUs up to Blackwell (RTX 5090 / sm_120) via CUDA 12.8 + PyTorch cu128.
+#
+# Build:
 #   docker build -t quasar-sandbox:latest -f validator/Dockerfile.sandbox .
 #
 # Build with specific CUDA version:
@@ -23,8 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.11 /usr/bin/python
 
-# Install PyTorch with CUDA support.
-# cu128 supports sm_120 (Blackwell/RTX 5090); use cu124 for older GPUs.
+# PyTorch with CUDA 12.8 — supports sm_120 (Blackwell / RTX 5090); use cu124 for older GPUs.
 ARG TORCH_CUDA=cu128
 RUN python3 -m pip install --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/${TORCH_CUDA}

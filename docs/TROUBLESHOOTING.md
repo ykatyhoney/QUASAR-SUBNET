@@ -14,6 +14,7 @@ Common issues and solutions for running QUASAR-SUBNET miners and validators.
 - [Validator: 401 Unauthorized After Moving Machines](#validator-401-unauthorized-after-moving-machines)
 - [Miner: docker_image Not Set (Logit Verification Fails)](#miner-docker_image-not-set-logit-verification-fails)
 - [Miner: Bazel Push Authentication Failed](#miner-bazel-push-authentication-failed)
+- [Validator: GPU Normalization Factor Not Detected](#validator-gpu-normalization-factor-not-detected)
 - [General: Port Already in Use](#general-port-already-in-use)
 
 ---
@@ -315,6 +316,53 @@ printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}' \
 ```
 
 Create an access token at [Docker Hub Security Settings](https://hub.docker.com/settings/security) with **Read/Write** permissions.
+
+---
+
+## Validator: GPU Normalization Factor Not Detected
+
+**Symptoms (validator logs):**
+
+```
+[GPU-NORM] WARNING: Could not detect GPU. Using factor 1.0 (reference baseline).
+```
+
+Or:
+
+```
+[GPU-NORM] WARNING: GPU 'Some Custom GPU Name' not in normalization table. Using factor 1.0.
+```
+
+**Cause:** The validator's GPU is either not visible to PyTorch/nvidia-smi, or it uses a non-standard name not in the default normalization table.
+
+**Fix:**
+
+1. **GPU not detected:** Ensure CUDA drivers and the NVIDIA Container Toolkit are installed:
+
+   ```bash
+   nvidia-smi                 # Should show your GPU
+   python3 -c "import torch; print(torch.cuda.get_device_name(0))"  # Should print GPU name
+   ```
+
+2. **GPU not in table:** Override manually in `.env`:
+
+   ```bash
+   # Set an explicit normalization factor
+   GPU_NORMALIZATION_FACTOR=0.75
+
+   # Or add your GPU to the lookup table (JSON)
+   GPU_NORMALIZATION_FACTORS='{"My Custom GPU Name": 0.75}'
+   ```
+
+   See `quasar/gpu_normalization.py` for the full default table and factor semantics.
+
+3. **Verify the factor is applied:** Check validator startup logs for:
+
+   ```
+   [VALIDATOR] GPU normalization: NVIDIA GeForce RTX 5090 (factor=1.00, matched='NVIDIA GeForce RTX 5090')
+   ```
+
+**Factor semantics:** `factor = your_gpu_throughput / rtx5090_throughput`. An RTX 5090 has factor 1.0. An H100 (~30% faster) has factor 1.30. An A100 (~30% slower) has factor 0.70.
 
 ---
 

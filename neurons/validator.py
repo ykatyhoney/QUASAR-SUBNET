@@ -33,6 +33,10 @@ from quasar.utils.context_builder import (
     validate_repo_structure,
     estimate_context_tokens,
 )
+from quasar.gpu_normalization import (
+    get_normalization_factor,
+    normalize_tps,
+)
 
 # --- Constants ---
 VALIDATOR_API_URL = os.getenv(
@@ -122,6 +126,16 @@ class PerformanceValidator:
         self.validator_api_url = VALIDATOR_API_URL
         self.temp_dir = tempfile.mkdtemp(prefix="quasar_validator_")
         self.validator_instance = validator_instance  # Reference to main Validator for logit verification
+
+        # GPU normalization — adjust measured TPS to a reference GPU baseline
+        # so different validator hardware produces comparable scores.
+        gpu_factor, gpu_name, matched_key = get_normalization_factor()
+        self.gpu_normalization_factor = gpu_factor
+        self.gpu_name = gpu_name
+        print(
+            f"[VALIDATOR] GPU normalization: {gpu_name} "
+            f"(factor={gpu_factor:.2f}, matched='{matched_key}')"
+        )
         print(f"[VALIDATOR] Initialized with temp dir: {self.temp_dir}")
 
     # --- AST helpers -----------------------------------------------------------
@@ -707,28 +721,12 @@ if __name__ == "__main__":
         )
         claimed_benchmarks_json = submission.get("benchmarks")
 
-        # Guard: claimed_performance must be a positive number
+        # Scoring is based purely on validator-measured TPS.
         try:
-            claimed_performance = (
                 float(raw_performance) if raw_performance is not None else None
             )
         except (TypeError, ValueError):
             claimed_performance = None
-        if not claimed_performance or claimed_performance <= 0:
-            print(
-                f"[VALIDATOR] ❌ Submission {submission.get('id')}: "
-                f"invalid claimed_performance={claimed_performance}"
-            )
-            return {
-                "submission_id": submission.get("id"),
-                "miner_hotkey": submission.get("miner_hotkey"),
-                "claimed_performance": claimed_performance,
-                "actual_performance": 0.0,
-                "score": 0.0,
-                "is_valid": False,
-                "errors": ["claimed_performance is None or <= 0"],
-                "reason": "Invalid claimed performance",
-            }
 
         # Parse claimed benchmarks if available
         claimed_benchmarks = {}
@@ -741,9 +739,12 @@ if __name__ == "__main__":
         print(f"\n[VALIDATOR] Validating submission: {submission.get('id')}")
         print(f"  Fork URL: {fork_url}")
         print(f"  Commit: {commit_hash}")
-        print(
-            f"  Claimed performance: {claimed_performance:.2f} tokens/sec @ seq_len={target_sequence_length}"
-        )
+        if claimed_performance and claimed_performance > 0:
+            print(
+                f"  Claimed performance (informational): {claimed_performance:.2f} tokens/sec @ seq_len={target_sequence_length}"
+            )
+        else:
+            print(f"  Target seq_len: {target_sequence_length}")
         if claimed_benchmarks:
             print(f"  Claimed benchmarks:")
             for seq_len, metrics in claimed_benchmarks.items():
@@ -808,33 +809,30 @@ if __name__ == "__main__":
                 target_results.get("tokens_per_sec", 0.0)
             )
 
-            # Calculate score: higher actual = higher rewards, lower actual = zero
-            # If actual >= claimed * 0.9, give full reward (10% tolerance)
-            # If actual < claimed * 0.9, give zero reward
-            tolerance = 0.9  # 90% of claimed
-            score = 0.0
-            if actual_performance >= claimed_performance * tolerance:
-                # Bonus for exceeding claimed performance
-                score = (
-                    1.0
-                    + (actual_performance - claimed_performance)
-                    / claimed_performance
-                )
-            else:
-                # Below tolerance, zero reward
-                score = 0.0
+            # ── Scoring (Option A): validator-measured TPS only ──
+            # The miner's claimed TPS is informational.  Ranking is based
+            # entirely on what the validator sandbox measures, after GPU
+            # normalization to a reference baseline.
+            gpu_factor = self.gpu_normalization_factor
+            normalized_actual = normalize_tps(actual_performance, gpu_factor)
+            score = 1.0 if normalized_actual > 0 else 0.0
 
             print(f"[VALIDATOR] Performance verification:")
             print(
-                f"  Claimed: {claimed_performance:.2f} tokens/sec @ seq_len={target_sequence_length}"
+                f"  Actual (raw): {actual_performance:.2f} tokens/sec @ seq_len={target_sequence_length}"
             )
-            print(
-                f"  Actual: {actual_performance:.2f} tokens/sec @ seq_len={target_sequence_length}"
-            )
-            print(
-                f"  Difference: {(actual_performance - claimed_performance) / claimed_performance * 100:.2f}%"
-            )
-            print(f"  Score: {score:.4f} (higher actual = higher rewards)")
+            if gpu_factor != 1.0:
+                print(
+                    f"  Actual (normalized to ref GPU): {normalized_actual:.2f} tokens/sec "
+                    f"(gpu_factor={gpu_factor:.2f})"
+                )
+            if claimed_performance and claimed_performance > 0:
+                diff_pct = (actual_performance - claimed_performance) / claimed_performance * 100
+                print(
+                    f"  Claimed (informational): {claimed_performance:.2f} tokens/sec "
+                    f"(diff={diff_pct:+.1f}%)"
+                )
+            print(f"  Score: {score:.4f} (pass/fail gate — ranking by validated TPS)")
 
             # Compare all reported sequence lengths
             print(f"[VALIDATOR] Benchmark comparison:")
@@ -872,12 +870,14 @@ if __name__ == "__main__":
                 "submission_id": submission.get("id"),
                 "miner_hotkey": submission.get("miner_hotkey"),
                 "claimed_performance": claimed_performance,
-                "actual_performance": actual_performance,
+                "actual_performance": normalized_actual,
+                "actual_performance_raw": actual_performance,
+                "gpu_normalization_factor": gpu_factor,
                 "results_by_seq_len": results_by_seq_len,
                 "score": score,
                 "fork_url": fork_url,
                 "commit_hash": commit_hash,
-                "repo_hash": repo_hash,  # Include repo_hash in result
+                "repo_hash": repo_hash,
             }
 
             if infra_failure:
@@ -950,7 +950,11 @@ class Validator(BaseValidatorNeuron):
         self.performance_validator = PerformanceValidator(
             validator_instance=self
         )
-        bt.logging.info("⚡ Performance validator initialized")
+        bt.logging.info(
+            f"⚡ Performance validator initialized "
+            f"(GPU: {self.performance_validator.gpu_name}, "
+            f"norm_factor: {self.performance_validator.gpu_normalization_factor:.2f})"
+        )
 
         # ═══════════════════════════════════════════════════════════════════════════
         # LOGIT VERIFICATION (from const's qllm architecture)
@@ -1680,9 +1684,9 @@ class Validator(BaseValidatorNeuron):
                 miner_hotkey = result.get("miner_hotkey") or "unknown"
                 score = result.get("score", 0.0)
 
-                # Use the score from validate_submission (already calculated)
-                # Normalize to 0-1 range (assuming max reasonable score is around 2.0)
-                normalized_score = min(score / 2.0, 1.0)
+                # Score is a pass/fail gate (1.0 or 0.0).  Actual ranking
+                # is determined by validated_tokens_per_sec in the API.
+                normalized_score = min(score, 1.0)
 
                 if score > 0:
                     print(

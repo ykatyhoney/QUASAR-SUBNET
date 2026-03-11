@@ -28,6 +28,10 @@
   - [Miner: Manual Docker Build (Local)](#miner-manual-docker-build-local)
   - [Validator: Sandbox Image](#validator-sandbox-image)
 - [Key Environment Variables](#key-environment-variables)
+- [Scoring Model](#scoring-model)
+  - [Validator-Measured TPS](#validator-measured-tps-no-claimed-tps-gate)
+  - [GPU Normalization](#gpu-normalization)
+  - [Recommended GPU Hardware](#recommended-gpu-hardware)
 - [GPU Hosting Compatibility](#gpu-hosting-compatibility)
 - [Required Imports (Critical!)](#required-imports-critical)
 - [Troubleshooting](#troubleshooting)
@@ -367,8 +371,62 @@ Defined in `.env` (see `.env.example` for full documentation):
 | `COSINE_SIM_THRESHOLD`      | `0.99`                                   | Validator    |
 | `MAX_ABS_DIFF_THRESHOLD`    | `0.1`                                    | Validator    |
 | `VALIDATOR_SANDBOX_IMAGE`   | `quasar-sandbox:latest`                  | Validator    |
+| `GPU_NORMALIZATION_FACTOR`  | (auto-detected)                          | Validator    |
+| `GPU_NORMALIZATION_FACTORS` | `{}`  (JSON overrides)                   | Validator    |
 | `MODEL_NAME`                | `Qwen/Qwen3-4B-Instruct-2507`           | Inference    |
 | `TARGET_SEQUENCE_LENGTH`    | `100000`                                 | Miner        |
+
+---
+
+## Scoring Model
+
+### Validator-Measured TPS (No Claimed TPS Gate)
+
+Miners report `tokens_per_sec` when submitting, but this value is **informational only**. Scoring is based entirely on what the validator measures in its sandbox:
+
+1. Validator clones the miner's repo and runs the kernel in a sandboxed Docker container.
+2. The measured TPS is GPU-normalized to a reference baseline (see below).
+3. If the kernel produces valid output (TPS > 0) and passes logit verification, the submission is ranked.
+4. Rankings use `validated_tokens_per_sec` — the top 4 performers in each round receive rewards (60%/25%/10%/5%).
+
+This means miners are never penalized for running on different hardware than the validator. The validator's sandbox measurement is the single source of truth.
+
+### GPU Normalization
+
+Different validators may run on different GPUs. To ensure consistent scoring across the network, measured TPS is normalized to a **reference GPU baseline** (RTX 5090):
+
+```
+normalized_tps = measured_tps / gpu_normalization_factor
+```
+
+| GPU | Factor | Notes |
+|-----|:------:|-------|
+| RTX 5090 | 1.00 | Reference GPU |
+| RTX 6000 Pro (Blackwell) | 1.10 | Recommended for validators |
+| H100 80GB | 1.30 | Datacenter |
+| RTX 4090 | 0.65 | Previous gen consumer |
+| A100 80GB SXM | 0.75 | Datacenter (Ampere) |
+| A100 40GB | 0.70 | Datacenter (Ampere) |
+| L40S | 0.55 | Datacenter (Ada) |
+
+The validator auto-detects its GPU and applies the factor. Override with:
+
+```bash
+# Manual factor override
+GPU_NORMALIZATION_FACTOR=1.10
+
+# Or add custom GPU entries (JSON)
+GPU_NORMALIZATION_FACTORS='{"My Custom GPU": 0.85}'
+```
+
+See `quasar/gpu_normalization.py` for the full default table.
+
+### Recommended GPU Hardware
+
+| Role | Recommended GPU | Notes |
+|------|----------------|-------|
+| **Miner** | RTX 5090 | Optimize kernels for Blackwell architecture |
+| **Validator** | RTX 5090 or RTX 6000 Pro | RTX 6000 Pro has 48GB VRAM, ideal for running reference model + sandbox |
 
 ---
 
