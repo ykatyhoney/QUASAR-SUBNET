@@ -1002,6 +1002,77 @@ class Validator(BaseValidatorNeuron):
             "Timestamp": timestamp,
         }
 
+    def _send_mark_validated(
+        self,
+        submission_id,
+        payload: Dict,
+        verification_result,
+    ):
+        """Send validation result to the API.
+
+        Merges verification_result fields into the payload when present,
+        then POSTs to /mark_validated_with_verification (falling back to
+        /mark_validated for older API versions).
+        """
+        # Merge verification fields into payload
+        if verification_result is not None:
+            verified = verification_result.get("verified")
+            payload["verified"] = bool(
+                verified if verified is not None else False
+            )
+            for key in ("cosine_similarity", "max_abs_diff"):
+                if verification_result.get(key) is not None:
+                    payload[key] = verification_result[key]
+            tp = verification_result.get(
+                "miner_throughput"
+            ) or verification_result.get("reference_throughput")
+            if tp is not None:
+                payload["throughput"] = tp
+            if verification_result.get("reason"):
+                payload["reason"] = verification_result["reason"]
+
+        score = payload.get("score", 0.0)
+        actual_tps = payload.get("actual_tokens_per_sec", 0.0)
+        print(
+            f"[VALIDATOR] 📤 Sending validation result for submission {submission_id}: "
+            f"score={score:.4f}, actual_tps={actual_tps:.2f}, "
+            f"verified={payload.get('verified', 'N/A')}, "
+            f"cosine_sim={payload.get('cosine_similarity', 'N/A')}, "
+            f"max_abs_diff={payload.get('max_abs_diff', 'N/A')}, "
+            f"reason={payload.get('reason', 'N/A')}",
+            flush=True,
+        )
+        response = requests.post(
+            f"{VALIDATOR_API_URL}/mark_validated_with_verification",
+            json=payload,
+            headers=self._api_auth_headers(),
+            timeout=30,
+        )
+        # Fallback: API hasn't been updated yet
+        if response.status_code == 404:
+            response = requests.post(
+                f"{VALIDATOR_API_URL}/mark_validated",
+                json=payload,
+                headers=self._api_auth_headers(),
+                timeout=30,
+            )
+            if verification_result is not None:
+                self.record_verification_result(
+                    submission_id, verification_result
+                )
+        if response.status_code == 200:
+            print(
+                f"[VALIDATOR] ✅ Submission {submission_id} marked validated: "
+                f"score={score:.4f}, actual_tps={actual_tps:.2f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[VALIDATOR] ⚠️ Failed to mark submission as validated: "
+                f"{response.status_code} - {response.text}",
+                flush=True,
+            )
+
     def load_reference_model(self):
         """Load the reference model for logit verification (lazy loading)."""
         if self.reference_model is not None:
@@ -1667,9 +1738,8 @@ class Validator(BaseValidatorNeuron):
                         verification_result = None
                         evaluated_scores[miner_hotkey] = normalized_score
 
-                    # Mark submission as validated in API and record score
-                    # Send the validator-measured actual_tokens_per_sec so rankings
-                    # use the real value, not the miner-claimed one.
+                    # Mark submission as validated in API and record score.
+                    # Verification fields are merged by _send_mark_validated.
                     actual_tps = result.get("actual_performance", 0.0)
                     if submission_id:
                         try:
@@ -1678,78 +1748,20 @@ class Validator(BaseValidatorNeuron):
                                 "score": normalized_score,
                                 "actual_tokens_per_sec": actual_tps,
                             }
-                            # Include verification fields if available
-                            if verification_result is not None:
-                                verified = verification_result.get("verified")
-                                if verified is None:
-                                    verified = False
-                                payload["verified"] = bool(verified)
-                                if (
-                                    verification_result.get(
-                                        "cosine_similarity"
-                                    )
-                                    is not None
-                                ):
-                                    payload["cosine_similarity"] = (
-                                        verification_result[
-                                            "cosine_similarity"
-                                        ]
-                                    )
-                                if (
-                                    verification_result.get("max_abs_diff")
-                                    is not None
-                                ):
-                                    payload["max_abs_diff"] = (
-                                        verification_result["max_abs_diff"]
-                                    )
-                                tp = verification_result.get(
-                                    "miner_throughput"
-                                ) or verification_result.get(
-                                    "reference_throughput"
-                                )
-                                if tp is not None:
-                                    payload["throughput"] = tp
-                                if verification_result.get("reason"):
-                                    payload["reason"] = verification_result[
-                                        "reason"
-                                    ]
-
-                            response = requests.post(
-                                f"{VALIDATOR_API_URL}/mark_validated_with_verification",
-                                json=payload,
-                                headers=self._api_auth_headers(),
-                                timeout=30,
+                            self._send_mark_validated(
+                                submission_id, payload, verification_result
                             )
-                            # Fallback: API hasn't been updated yet
-                            if response.status_code == 404:
-                                response = requests.post(
-                                    f"{VALIDATOR_API_URL}/mark_validated",
-                                    json=payload,
-                                    headers=self._api_auth_headers(),
-                                    timeout=30,
-                                )
-                                if verification_result is not None:
-                                    self.record_verification_result(
-                                        submission_id, verification_result
-                                    )
-                            if response.status_code == 200:
-                                print(
-                                    f"[VALIDATOR] ✅ Submission {submission_id} marked validated: score={normalized_score:.4f}, actual_tps={actual_tps:.2f}",
-                                    flush=True,
-                                )
-                            else:
-                                print(
-                                    f"[VALIDATOR] ⚠️ Failed to mark submission as validated: {response.status_code} - {response.text}",
-                                    flush=True,
-                                )
                         except Exception as e:
                             print(
                                 f"[VALIDATOR] Failed to mark submission as validated: {e}",
                                 flush=True,
                             )
                 else:
+                    actual_tps = result.get("actual_performance", 0.0)
+                    reason = result.get("reason") or result.get("error") or "Benchmark failed"
                     print(
-                        f"[VALIDATOR] ❌ Invalid submission from {miner_hotkey[:12]}...",
+                        f"[VALIDATOR] ❌ Invalid submission from {miner_hotkey[:12]}... "
+                        f"(actual_tps={actual_tps:.2f}, reason={reason})",
                         flush=True,
                     )
                     evaluated_scores[miner_hotkey] = 0.0
@@ -1774,40 +1786,20 @@ class Validator(BaseValidatorNeuron):
                                 flush=True,
                             )
 
-                    # Still mark as validated to avoid re-processing (with score 0.0)
+                    # Still mark as validated to avoid re-processing
+                    # Include actual_tps and reason so the API has full context
                     submission_id = submission.get("id")
                     if submission_id:
                         try:
-                            fail_payload = {
+                            payload = {
                                 "submission_id": submission_id,
                                 "score": 0.0,
+                                "actual_tokens_per_sec": actual_tps,
+                                "reason": reason,
                             }
-                            response = requests.post(
-                                f"{VALIDATOR_API_URL}/mark_validated",
-                                json={
-                                    "submission_id": submission_id,
-                                    "score": 0.0,
-                                },
-                                headers=self._api_auth_headers(),
-                                timeout=30,
+                            self._send_mark_validated(
+                                submission_id, payload, None
                             )
-                            if response.status_code == 404:
-                                response = requests.post(
-                                    f"{VALIDATOR_API_URL}/mark_validated",
-                                    json=fail_payload,
-                                    headers=self._api_auth_headers(),
-                                    timeout=30,
-                                )
-                            if response.status_code == 200:
-                                print(
-                                    f"[VALIDATOR] ✅ Submission {submission_id} marked as validated with score 0.0",
-                                    flush=True,
-                                )
-                            else:
-                                print(
-                                    f"[VALIDATOR] ⚠️ Failed to mark submission as validated: {response.status_code} - {response.text}",
-                                    flush=True,
-                                )
                         except Exception as e:
                             print(
                                 f"[VALIDATOR] Failed to mark submission as validated: {e}",
