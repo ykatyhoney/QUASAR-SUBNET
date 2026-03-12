@@ -16,8 +16,7 @@ if [ -d ".venv" ]; then
     source .venv/bin/activate
     echo "✅ Activated virtual environment"
 else
-    echo "❌ Virtual environment not found. Create it with: python3 -m venv .venv"
-    exit 1
+    echo "⚠️  No .venv found — using system Python"
 fi
 
 # Load environment variables
