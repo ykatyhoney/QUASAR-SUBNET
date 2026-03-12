@@ -316,7 +316,16 @@ class PerformanceValidator:
                 )
                 return []
             data = response.json()
-            return data.get("submissions", [])
+            total_pending = data.get("total_pending", 0)
+            submissions = data.get("submissions", [])
+            if total_pending > len(submissions):
+                print(
+                    f"[VALIDATOR] Pending backlog: {total_pending} total, "
+                    f"fetched {len(submissions)} (oldest-first). "
+                    f"Increase VALIDATOR_PENDING_BATCH_SIZE to drain faster.",
+                    flush=True,
+                )
+            return submissions
         except Exception as e:
             print(f"[VALIDATOR] Error fetching pending submissions: {e}")
             return []
@@ -1628,8 +1637,8 @@ class Validator(BaseValidatorNeuron):
         evaluated_scores = {}  # hotkey -> score
 
         try:
-            # Fetch pending submissions from API (batch size configurable for backlog drain)
-            batch_size = int(os.getenv("VALIDATOR_PENDING_BATCH_SIZE", "10"))
+            # Fetch pending submissions from API (oldest-first, configurable batch size)
+            batch_size = int(os.getenv("VALIDATOR_PENDING_BATCH_SIZE", "25"))
             submissions = self.performance_validator.fetch_pending_submissions(
                 limit=batch_size
             )

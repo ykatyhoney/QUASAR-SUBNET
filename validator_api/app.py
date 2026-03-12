@@ -1896,16 +1896,25 @@ def get_pending_validations(
         .filter(models.SpeedSubmission.network == network)
         .filter(models.SpeedSubmission.validated == False)
         .filter(models.SpeedSubmission.is_revealed == True)
-        .order_by(models.SpeedSubmission.created_at.desc())
+        .order_by(models.SpeedSubmission.created_at.asc())
     )
     if flagged_hotkeys:
         submissions_q = submissions_q.filter(
             ~models.SpeedSubmission.miner_hotkey.in_(flagged_hotkeys)
         )
+
+    total_pending = submissions_q.count()
     submissions = submissions_q.limit(limit).all()
+
+    if total_pending > len(submissions):
+        print(
+            f"[PENDING] Returning {len(submissions)}/{total_pending} pending submissions "
+            f"(oldest-first, limit={limit})"
+        )
 
     return {
         "pending_count": len(submissions),
+        "total_pending": total_pending,
         "submissions": [
             {
                 "id": s.id,
