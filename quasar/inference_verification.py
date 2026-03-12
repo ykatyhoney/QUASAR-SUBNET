@@ -525,10 +525,17 @@ def run_container_inference(
             "read_only": True,
             "security_opt": ["no-new-privileges"],
             "pids_limit": 1024,
-            # Writable dirs the inference server may need
+            # Writable dirs the inference server / runtime may need.
+            # The root filesystem stays read-only for security; only
+            # these tmpfs mounts are writable.
             "tmpfs": {
                 "/tmp": "size=2G",
                 "/root/.cache": "size=4G",
+                "/var/lib/apt/lists": "size=64M",
+                "/var/log": "size=64M",
+                "/var/tmp": "size=256M",
+                "/run": "size=64M",
+                "/home": "size=1G",
             },
         }
         if gpu_enabled:
