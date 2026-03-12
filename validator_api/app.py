@@ -1191,16 +1191,23 @@ BLOCKS_UNTIL_REVEAL = int(
 BLOCK_TIME_SECONDS = 12  # Bittensor block time
 
 _subtensor_instance = None
+_subtensor_consecutive_failures = 0
+_SUBTENSOR_MAX_FAILURES = 3
+
+_last_chain_block = None
+_last_chain_block_time = 0.0
 
 
-def _get_subtensor():
+def _get_subtensor(force_reconnect: bool = False):
     global _subtensor_instance
-    if _subtensor_instance is None:
+    if _subtensor_instance is None or force_reconnect:
+        _subtensor_instance = None
         try:
             import bittensor as bt
 
             network = os.environ.get("SUBTENSOR_NETWORK", "finney")
             _subtensor_instance = bt.subtensor(network=network)
+            print(f"✅ [BLOCK] Connected to subtensor ({network})", flush=True)
         except Exception as e:
             print(
                 f"⚠️ [BLOCK] Failed to connect to subtensor: {e}", flush=True
@@ -1209,27 +1216,55 @@ def _get_subtensor():
 
 
 def get_current_block() -> int:
-    """Get current Bittensor block number from the chain, with time-based fallback."""
+    """Get current Bittensor block number from the chain, with reconnect and caching."""
+    global _subtensor_consecutive_failures, _last_chain_block, _last_chain_block_time
+    import time as _time
+
+    # Try the live chain first
     try:
-        sub = _get_subtensor()
+        reconnect = _subtensor_consecutive_failures >= _SUBTENSOR_MAX_FAILURES
+        if reconnect and _subtensor_consecutive_failures > 0:
+            print(
+                f"🔄 [BLOCK] Reconnecting to subtensor after {_subtensor_consecutive_failures} failures",
+                flush=True,
+            )
+        sub = _get_subtensor(force_reconnect=reconnect)
         if sub is not None:
-            block = sub.get_current_block()
-            return int(block)
+            block = int(sub.get_current_block())
+            _subtensor_consecutive_failures = 0
+            _last_chain_block = block
+            _last_chain_block_time = _time.time()
+            return block
     except Exception as e:
+        _subtensor_consecutive_failures += 1
         print(
-            f"⚠️ [BLOCK] Chain query failed, using time fallback: {e}",
+            f"⚠️ [BLOCK] Chain query failed (attempt {_subtensor_consecutive_failures}): {e}",
             flush=True,
         )
-    # Fallback: time-based approximation (only used if chain is unreachable).
-    # Not accurate for absolute block numbers but preserves relative timing
-    # for commit-reveal delays.
-    import time
 
-    GENESIS_TIME = (
-        1687939200  # ~Jun 28, 2023 (Bittensor finney approximate genesis)
+    # Fallback 1: extrapolate from last known good block (much more accurate
+    # than the genesis-based fallback since drift is bounded).
+    if _last_chain_block is not None:
+        elapsed = _time.time() - _last_chain_block_time
+        estimated = _last_chain_block + int(elapsed / BLOCK_TIME_SECONDS)
+        staleness_min = elapsed / 60
+        print(
+            f"⚠️ [BLOCK] Using extrapolated block {estimated} "
+            f"(base={_last_chain_block}, +{elapsed:.0f}s / {staleness_min:.1f}min stale)",
+            flush=True,
+        )
+        return estimated
+
+    # Fallback 2: genesis-based time approximation (only on first startup
+    # when chain has never been reachable).
+    GENESIS_TIME = 1687939200
+    current_time = int(_time.time())
+    estimated = (current_time - GENESIS_TIME) // BLOCK_TIME_SECONDS
+    print(
+        f"⚠️ [BLOCK] Using genesis-based fallback block {estimated} (chain never connected)",
+        flush=True,
     )
-    current_time = int(time.time())
-    return (current_time - GENESIS_TIME) // BLOCK_TIME_SECONDS
+    return estimated
 
 
 @app.post("/commit_submission", response_model=models.CommitSubmissionResponse)
