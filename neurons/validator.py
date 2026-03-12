@@ -722,11 +722,7 @@ if __name__ == "__main__":
         claimed_benchmarks_json = submission.get("benchmarks")
 
         # Scoring is based purely on validator-measured TPS.
-        try:
-                float(raw_performance) if raw_performance is not None else None
-            )
-        except (TypeError, ValueError):
-            claimed_performance = None
+        # Miner's claimed TPS is logged for info only, never used in scoring.
 
         # Parse claimed benchmarks if available
         claimed_benchmarks = {}
@@ -739,12 +735,7 @@ if __name__ == "__main__":
         print(f"\n[VALIDATOR] Validating submission: {submission.get('id')}")
         print(f"  Fork URL: {fork_url}")
         print(f"  Commit: {commit_hash}")
-        if claimed_performance and claimed_performance > 0:
-            print(
-                f"  Claimed performance (informational): {claimed_performance:.2f} tokens/sec @ seq_len={target_sequence_length}"
-            )
-        else:
-            print(f"  Target seq_len: {target_sequence_length}")
+        print(f"  Target seq_len: {target_sequence_length}")
         if claimed_benchmarks:
             print(f"  Claimed benchmarks:")
             for seq_len, metrics in claimed_benchmarks.items():
@@ -769,7 +760,7 @@ if __name__ == "__main__":
                 return {
                     "submission_id": submission.get("id"),
                     "miner_hotkey": submission.get("miner_hotkey"),
-                    "claimed_performance": claimed_performance,
+                    "claimed_performance": None,
                     "actual_performance": 0.0,
                     "score": 0.0,
                     "is_valid": False,
@@ -826,12 +817,6 @@ if __name__ == "__main__":
                     f"  Actual (normalized to ref GPU): {normalized_actual:.2f} tokens/sec "
                     f"(gpu_factor={gpu_factor:.2f})"
                 )
-            if claimed_performance and claimed_performance > 0:
-                diff_pct = (actual_performance - claimed_performance) / claimed_performance * 100
-                print(
-                    f"  Claimed (informational): {claimed_performance:.2f} tokens/sec "
-                    f"(diff={diff_pct:+.1f}%)"
-                )
             print(f"  Score: {score:.4f} (pass/fail gate — ranking by validated TPS)")
 
             # Compare all reported sequence lengths
@@ -869,7 +854,7 @@ if __name__ == "__main__":
             result = {
                 "submission_id": submission.get("id"),
                 "miner_hotkey": submission.get("miner_hotkey"),
-                "claimed_performance": claimed_performance,
+                "claimed_performance": None,
                 "actual_performance": normalized_actual,
                 "actual_performance_raw": actual_performance,
                 "gpu_normalization_factor": gpu_factor,
@@ -896,7 +881,7 @@ if __name__ == "__main__":
             return {
                 "submission_id": submission.get("id"),
                 "miner_hotkey": submission.get("miner_hotkey"),
-                "claimed_performance": claimed_performance,
+                "claimed_performance": None,
                 "actual_performance": 0.0,
                 "score": 0.0,
                 "error": str(e),
@@ -908,7 +893,7 @@ if __name__ == "__main__":
             return {
                 "submission_id": submission.get("id"),
                 "miner_hotkey": submission.get("miner_hotkey"),
-                "claimed_performance": claimed_performance,
+                "claimed_performance": None,
                 "actual_performance": 0.0,
                 "score": 0.0,
                 "error": str(e),
