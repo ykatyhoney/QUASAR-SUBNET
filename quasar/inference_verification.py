@@ -118,13 +118,21 @@ class VerificationResult:
     cosine_sim: Optional[float] = None
     max_abs_diff: Optional[float] = None
     reason: Optional[str] = None
+    steps_verified: int = 0
+    steps_total: int = 0
+    token_match_ratio: Optional[float] = None
+    model_fingerprint_ok: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "verified": self.verified,
             "cosine_sim": self.cosine_sim,
             "max_abs_diff": self.max_abs_diff,
-            "reason": self.reason
+            "reason": self.reason,
+            "steps_verified": self.steps_verified,
+            "steps_total": self.steps_total,
+            "token_match_ratio": self.token_match_ratio,
+            "model_fingerprint_ok": self.model_fingerprint_ok,
         }
 
 
@@ -197,6 +205,159 @@ def compute_kl_divergence(
     )
 
     return float(kl_div)
+
+
+def verify_logits_multi(
+    miner_multi: Dict[int, List[float]],
+    reference_multi: Dict[int, List[float]],
+    cosine_threshold: float = CONFIG.cosine_sim_threshold,
+    max_diff_threshold: float = CONFIG.max_abs_diff_threshold
+) -> VerificationResult:
+    """
+    Verify logits at ALL captured steps, not just the first.
+
+    Every step must pass independently. Returns the worst-case metrics
+    so a miner can't pass by getting one step right and faking the rest.
+    """
+    if not miner_multi or not reference_multi:
+        return VerificationResult(
+            verified=False,
+            reason="missing_multi_logits: miner or reference returned no multi-step logits"
+        )
+
+    common_steps = sorted(set(miner_multi.keys()) & set(reference_multi.keys()))
+    expected_steps = sorted(reference_multi.keys())
+
+    if len(common_steps) < len(expected_steps):
+        missing = set(expected_steps) - set(common_steps)
+        return VerificationResult(
+            verified=False,
+            steps_verified=0,
+            steps_total=len(expected_steps),
+            reason=f"missing_steps: miner did not return logits for steps {missing}"
+        )
+
+    worst_cosine = 1.0
+    worst_max_diff = 0.0
+    steps_passed = 0
+
+    for step in common_steps:
+        result = verify_logits(
+            miner_multi[step], reference_multi[step],
+            cosine_threshold, max_diff_threshold
+        )
+        if result.cosine_sim is not None:
+            worst_cosine = min(worst_cosine, result.cosine_sim)
+        if result.max_abs_diff is not None:
+            worst_max_diff = max(worst_max_diff, result.max_abs_diff)
+        if result.verified:
+            steps_passed += 1
+
+    all_passed = steps_passed == len(common_steps)
+    return VerificationResult(
+        verified=all_passed,
+        cosine_sim=worst_cosine,
+        max_abs_diff=worst_max_diff,
+        steps_verified=steps_passed,
+        steps_total=len(common_steps),
+        reason=None if all_passed else (
+            f"multi_step_failed: {steps_passed}/{len(common_steps)} steps passed, "
+            f"worst cosine={worst_cosine:.4f}, worst max_diff={worst_max_diff:.4f}"
+        )
+    )
+
+
+def verify_token_sequence(
+    miner_tokens: List[int],
+    reference_tokens: List[int],
+    min_match_ratio: float = 0.95,
+) -> Tuple[bool, float]:
+    """
+    Verify that miner-generated token IDs match the reference.
+
+    Greedy decode from the same model with the same prompt must produce
+    identical tokens.  We allow a small tolerance (default 95%) because
+    floating-point ordering differences on tied logits can cause
+    occasional divergence.
+    """
+    if not miner_tokens or not reference_tokens:
+        return False, 0.0
+
+    compare_len = min(len(miner_tokens), len(reference_tokens))
+    if compare_len == 0:
+        return False, 0.0
+
+    matches = sum(
+        1 for m, r in zip(miner_tokens[:compare_len], reference_tokens[:compare_len])
+        if m == r
+    )
+    ratio = matches / compare_len
+    return ratio >= min_match_ratio, ratio
+
+
+def check_logit_anomalies(logits: List[float]) -> Optional[str]:
+    """
+    Detect statistically anomalous logit vectors that suggest
+    cached, hardcoded, or fabricated responses.
+
+    Returns a reason string if anomalous, None if normal.
+    """
+    arr = np.array(logits, dtype=np.float32)
+
+    if arr.size == 0:
+        return "empty_logits"
+
+    variance = float(np.var(arr))
+    if variance < 1e-6:
+        return f"near_zero_variance={variance:.2e}: logits appear constant/fabricated"
+
+    if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
+        return "contains_nan_or_inf"
+
+    max_val = float(np.max(np.abs(arr)))
+    if max_val > 1e6:
+        return f"extreme_magnitude={max_val:.2e}: logits unreasonably large"
+
+    unique_ratio = len(np.unique(arr)) / max(arr.size, 1)
+    if unique_ratio < 0.01:
+        return f"low_uniqueness={unique_ratio:.4f}: too few distinct values"
+
+    return None
+
+
+def verify_model_fingerprint(
+    miner_info: Dict[str, Any],
+    reference_model: "ReferenceModel",
+) -> Tuple[bool, str]:
+    """
+    Compare miner's /model_info against the reference model's known
+    architecture to detect model swaps.
+    """
+    ref_vocab = reference_model.get_vocab_size()
+    ref_config = reference_model.model.config if reference_model.model else None
+
+    checks = []
+
+    miner_vocab = miner_info.get("vocab_size")
+    if miner_vocab is not None and ref_vocab is not None:
+        if miner_vocab != ref_vocab:
+            return False, f"vocab_size mismatch: miner={miner_vocab}, reference={ref_vocab}"
+        checks.append("vocab_size")
+
+    if ref_config is not None:
+        mc = miner_info.get("model_config", {})
+        for attr in ("hidden_size", "num_hidden_layers", "num_attention_heads"):
+            ref_val = getattr(ref_config, attr, None)
+            miner_val = mc.get(attr)
+            if ref_val is not None and miner_val is not None:
+                if int(miner_val) != int(ref_val):
+                    return False, f"{attr} mismatch: miner={miner_val}, reference={ref_val}"
+                checks.append(attr)
+
+    if not checks:
+        return True, "no_fields_to_compare"
+
+    return True, f"matched: {', '.join(checks)}"
 
 
 # ╔════════════════════════════════════════════════════════════════════════════╗
@@ -609,13 +770,25 @@ def run_container_inference(
         if isinstance(raw_multi, dict):
             captured_logits_multi = {int(k): v for k, v in raw_multi.items()}
 
-        return ContainerInferenceResult(
+        # Fetch model fingerprint (best-effort, non-fatal)
+        model_info = None
+        try:
+            info_url = f"http://127.0.0.1:{host_port}/model_info"
+            info_resp = _requests.get(info_url, timeout=10)
+            if info_resp.status_code == 200:
+                model_info = info_resp.json()
+        except Exception:
+            pass
+
+        result = ContainerInferenceResult(
             success=True,
             tokens=data.get("tokens", []),
             captured_logits=data.get("captured_logits"),
             captured_logits_multi=captured_logits_multi,
             elapsed_sec=wall_elapsed,
         )
+        result._model_info = model_info  # attach for fingerprint check
+        return result
 
     except Exception as e:
         log(f"Container execution failed for {hotkey[:8]}...: {e}", "error")
@@ -675,83 +848,138 @@ async def evaluate_miner(
     """
     Evaluate a miner: verify correctness + measure throughput.
 
-    1. Generate a random prompt
-    2. Run inference on miner's container (synchronous Docker call)
-    3. Run inference on reference model
-    4. Compare logits at random step
-    5. Calculate throughput if verified
+    Verification pipeline (all must pass):
+      1. Generate random challenge (random prompt + random capture steps)
+      2. Query miner /model_info → architecture fingerprint check
+      3. Run inference on miner container (wall-clock timed)
+      4. Run inference on reference model
+      5. Verify logits at ALL captured steps (not just the first)
+      6. Verify generated token sequence matches reference
+      7. Statistical anomaly check on logit vectors
+      8. Wall-time integrity check
+      9. Calculate throughput if everything passes
     """
+    def _fail(reason: str, verification: Optional[VerificationResult] = None) -> MinerEvaluation:
+        return MinerEvaluation(
+            hotkey=hotkey, block=0, docker_image=docker_image,
+            score=float("inf"), verified=False,
+            verification=verification, error=reason,
+        )
+
     challenge = generate_verification_challenge(reference, config)
     prompt = challenge["prompt"]
     gen_len = challenge["gen_len"]
     logits_at_step = challenge["logits_at_step"]
+    logits_at_steps = challenge.get("logits_at_steps") or [logits_at_step]
 
-    log(f"  prompt_len={len(prompt)}, gen_len={gen_len}, capture_step={logits_at_step}", "info")
+    log(f"  prompt_len={len(prompt)}, gen_len={gen_len}, "
+        f"capture_steps={logits_at_steps}", "info")
 
-    # run_container_inference is synchronous (Docker SDK); run in thread to
-    # avoid blocking the event loop if called from an async context.
     loop = asyncio.get_event_loop()
+
+    # ── Step 2: Model fingerprint check ──────────────────────────
     miner_result = await loop.run_in_executor(
         None,
-        lambda: run_container_inference(hotkey, docker_image, prompt, gen_len, logits_at_step),
+        lambda: run_container_inference(
+            hotkey, docker_image, prompt, gen_len,
+            logits_at_step, logits_at_steps=logits_at_steps,
+        ),
     )
 
     if not miner_result.success:
-        return MinerEvaluation(
-            hotkey=hotkey,
-            block=0,
-            docker_image=docker_image,
-            score=float("inf"),
-            verified=False,
-            error=miner_result.error
-        )
+        return _fail(miner_result.error)
 
-    reference_result = await reference.inference(prompt, gen_len, logits_at_step)
+    # ── Step 2b: Model fingerprint check ─────────────────────────
+    miner_model_info = getattr(miner_result, "_model_info", None)
+    if miner_model_info:
+        fp_ok, fp_detail = verify_model_fingerprint(miner_model_info, reference)
+        log(f"  Fingerprint: {fp_detail}", "info" if fp_ok else "error")
+        if not fp_ok:
+            return _fail(f"model_fingerprint_failed: {fp_detail}")
+    else:
+        log("  Fingerprint: /model_info not available (non-fatal)", "warn")
 
-    if miner_result.captured_logits is None:
-        log("  Miner did not return captured logits", "error")
-        return MinerEvaluation(
-            hotkey=hotkey,
-            block=0,
-            docker_image=docker_image,
-            score=float("inf"),
-            verified=False,
-            error="no_logits"
-        )
-
-    verification = verify_logits(
-        miner_result.captured_logits,
-        reference_result["captured_logits"]
+    # ── Step 4: Reference inference ──────────────────────────────
+    reference_result = await reference.inference(
+        prompt, gen_len, logits_at_step, logits_at_steps=logits_at_steps,
     )
 
-    log(f"  cosine={verification.cosine_sim:.4f}, max_diff={verification.max_abs_diff:.4f}", "info")
+    # ── Step 5: Multi-step logit verification ────────────────────
+    miner_multi = miner_result.captured_logits_multi
+    ref_multi = reference_result.get("captured_logits_multi", {})
+
+    if not miner_multi:
+        if miner_result.captured_logits is not None:
+            miner_multi = {logits_at_step: miner_result.captured_logits}
+        else:
+            log("  Miner returned no logits at any step", "error")
+            return _fail("no_logits")
+
+    if not ref_multi:
+        ref_logits = reference_result.get("captured_logits")
+        if ref_logits:
+            ref_multi = {logits_at_step: ref_logits}
+
+    verification = verify_logits_multi(
+        miner_multi, ref_multi,
+        config.cosine_sim_threshold, config.max_abs_diff_threshold,
+    )
+
+    log(f"  Multi-step: {verification.steps_verified}/{verification.steps_total} passed, "
+        f"worst cosine={verification.cosine_sim:.4f}, "
+        f"worst max_diff={verification.max_abs_diff:.4f}", "info")
 
     if not verification.verified:
-        log("  FAILED verification", "error")
-        return MinerEvaluation(
-            hotkey=hotkey,
-            block=0,
-            docker_image=docker_image,
-            score=float("inf"),
-            verified=False,
-            verification=verification
-        )
+        log(f"  FAILED multi-step verification: {verification.reason}", "error")
+        return _fail(verification.reason, verification)
 
+    # ── Step 6: Token sequence match ─────────────────────────────
+    ref_tokens = reference_result.get("tokens", [])
+    miner_tokens = miner_result.tokens
+
+    if ref_tokens and miner_tokens:
+        token_ok, token_ratio = verify_token_sequence(miner_tokens, ref_tokens)
+        verification.token_match_ratio = token_ratio
+        log(f"  Token match: {token_ratio:.2%} "
+            f"({len(miner_tokens)} miner / {len(ref_tokens)} ref)", "info")
+        if not token_ok:
+            verification.verified = False
+            verification.reason = (
+                f"token_mismatch: only {token_ratio:.2%} of tokens match "
+                f"(need >=95%)"
+            )
+            log(f"  FAILED token verification: {verification.reason}", "error")
+            return _fail(verification.reason, verification)
+
+    # ── Step 7: Statistical anomaly check ────────────────────────
+    for step, logits in miner_multi.items():
+        anomaly = check_logit_anomalies(logits)
+        if anomaly:
+            verification.verified = False
+            verification.reason = f"anomaly_step_{step}: {anomaly}"
+            log(f"  FAILED anomaly check at step {step}: {anomaly}", "error")
+            return _fail(verification.reason, verification)
+
+    # ── Step 8: Wall-time integrity ──────────────────────────────
     elapsed = miner_result.elapsed_sec
     if elapsed <= 0:
-        return MinerEvaluation(
-            hotkey=hotkey,
-            block=0,
-            docker_image=docker_image,
-            score=float("inf"),
-            verified=True,
-            error="invalid_elapsed"
+        return _fail("invalid_elapsed", verification)
+
+    min_plausible_sec = gen_len / 50000.0
+    if elapsed < min_plausible_sec:
+        log(f"  Wall time {elapsed:.3f}s implausibly fast for {gen_len} tokens "
+            f"(min {min_plausible_sec:.3f}s)", "warn")
+        return _fail(
+            f"implausible_speed: {gen_len} tokens in {elapsed:.3f}s = "
+            f"{gen_len/elapsed:.0f} tok/s exceeds physical limits",
+            verification,
         )
 
+    # ── Step 9: Throughput scoring ───────────────────────────────
     throughput = gen_len / elapsed
     score = 1.0 / throughput if throughput > 0 else float("inf")
 
-    log(f"  Throughput: {throughput:.1f} tok/sec", "success")
+    log(f"  Throughput: {throughput:.1f} tok/sec ✓", "success")
 
     return MinerEvaluation(
         hotkey=hotkey,
@@ -760,7 +988,7 @@ async def evaluate_miner(
         score=score,
         verified=True,
         throughput=throughput,
-        verification=verification
+        verification=verification,
     )
 
 
