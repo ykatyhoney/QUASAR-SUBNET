@@ -1,6 +1,6 @@
 # QUASAR Miner CPU Inference Image (for Render / CPU-only servers)
 #
-# All dependencies installed at BUILD time — no network needed at runtime.
+# Everything installed at BUILD time — no network needed at runtime.
 #
 # Build:
 #   docker build -f Dockerfile.cpu -t quasar-miner-cpu:latest .
@@ -17,7 +17,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY miner/inference_server.py .
 
-ENV MODEL_NAME="Qwen/Qwen3-4B-Instruct-2507"
+ARG MODEL_NAME="Qwen/Qwen3-4B-Instruct-2507"
+ARG HF_TOKEN=""
+RUN python -c "\
+from huggingface_hub import snapshot_download; \
+import os; \
+token = os.environ.get('HF_TOKEN') or None; \
+snapshot_download( \
+    repo_id='${MODEL_NAME}', \
+    local_dir='/app/model', \
+    token=token, \
+)" && echo "Model downloaded: ${MODEL_NAME}"
+
+ENV MODEL_NAME="/app/model"
 ENV DEVICE="cpu"
 ENV HOST="0.0.0.0"
 ENV PORT=8000

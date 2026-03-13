@@ -1,14 +1,19 @@
 # QUASAR Miner GPU Inference Image
 #
-# All dependencies are installed at BUILD time so the container works
-# in network-isolated environments (validators run containers on an
-# internal-only Docker network with no internet access).
+# Everything — packages, pip deps, AND model weights — is installed at
+# BUILD time so the container works in network-isolated environments
+# (validators run containers on an internal-only Docker network with
+# no internet access).
 #
 # Build:
-#   docker build -f Dockerfile.gpu -t quasar-miner-gpu:latest .
+#   docker build --no-cache -f Dockerfile.gpu -t quasar-miner-gpu:latest .
 #
-# Push without Docker daemon (RunPod):
-#   See push_miner.sh
+# Build with a different model:
+#   docker build --build-arg MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct ...
+#
+# The image is large (~10-15 GB) because it includes the full model
+# weights.  This is intentional — the container CANNOT download
+# anything at runtime.
 
 ARG CUDA_VERSION=12.2.0
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04
@@ -28,7 +33,22 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY miner/inference_server.py .
 
-ENV MODEL_NAME="Qwen/Qwen3-4B-Instruct-2507"
+# Download model weights at build time so the container is fully
+# self-contained.  The model is saved to /app/model/ and
+# MODEL_NAME is pointed at the local path.
+ARG MODEL_NAME="Qwen/Qwen3-4B-Instruct-2507"
+ARG HF_TOKEN=""
+RUN python3 -c "\
+from huggingface_hub import snapshot_download; \
+import os; \
+token = os.environ.get('HF_TOKEN') or None; \
+snapshot_download( \
+    repo_id='${MODEL_NAME}', \
+    local_dir='/app/model', \
+    token=token, \
+)" && echo "Model downloaded: ${MODEL_NAME}"
+
+ENV MODEL_NAME="/app/model"
 ENV DEVICE="cuda"
 ENV HOST="0.0.0.0"
 ENV PORT=8000
