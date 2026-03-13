@@ -519,9 +519,17 @@ def run_container_inference(
             # but CANNOT reach the internet or LAN.
             "network": verify_network.name,
             "cap_drop": ["ALL"],
-            # Re-add only the minimum capabilities needed for GPU +
-            # serving on the mapped port.
-            "cap_add": ["SYS_PTRACE"],  # needed by some CUDA runtimes
+            # Re-add only the minimum capabilities needed for GPU,
+            # serving on the mapped port, and common container runtimes
+            # (apt, user switching, file ownership in tmpfs mounts).
+            "cap_add": [
+                "SYS_PTRACE",  # CUDA runtimes (stacktrace, debugger attach)
+                "SETUID",      # seteuid — apt, gosu, su (switch to non-root)
+                "SETGID",      # setegid/setgroups — apt privilege separation
+                "CHOWN",       # chown in writable tmpfs dirs (apt, pip)
+                "FOWNER",      # operations on files regardless of owner (pip cache)
+                "DAC_OVERRIDE",  # bypass read/write/execute permission checks (apt partial dirs)
+            ],
             "read_only": True,
             "security_opt": ["no-new-privileges"],
             "pids_limit": 1024,
@@ -532,6 +540,7 @@ def run_container_inference(
                 "/tmp": "size=2G",
                 "/root/.cache": "size=4G",
                 "/var/lib/apt/lists": "size=64M",
+                "/var/cache/apt": "size=256M",
                 "/var/log": "size=64M",
                 "/var/tmp": "size=256M",
                 "/run": "size=64M",
