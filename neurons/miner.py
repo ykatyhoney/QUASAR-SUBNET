@@ -1720,6 +1720,7 @@ class Miner(BaseMinerNeuron):
                     # Set environment variable for memory management
                     env = os.environ.copy()
                     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+                    env["PYTHONUNBUFFERED"] = "1"
 
                     result = subprocess.run(
                         [sys.executable, test_script_path],
@@ -1730,8 +1731,16 @@ class Miner(BaseMinerNeuron):
                     )
 
                     if result.returncode != 0:
+                        exit_reason = f"exit code {result.returncode}"
+                        if result.returncode < 0:
+                            import signal
+                            try:
+                                sig_name = signal.Signals(-result.returncode).name
+                                exit_reason = f"signal {sig_name} ({result.returncode})"
+                            except (ValueError, AttributeError):
+                                exit_reason = f"signal {-result.returncode}"
                         print(
-                            f"[MINER] Tests Failed:\n{result.stderr}",
+                            f"[MINER] Tests Failed ({exit_reason}):\n{result.stderr}",
                             flush=True,
                         )
 

@@ -11,7 +11,64 @@ os.environ["TRITON_PRINT_DEBUG"] = "1"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from fla.layers.quasar import QuasarAttention
+import sys
+import types
+
+def _import_quasar_attention():
+    """Import only QuasarAttention, bypassing broken eager imports in fla.
+
+    The upstream fla package eagerly imports ALL layers and ALL ops in its
+    __init__.py files (fla/__init__.py, fla/layers/__init__.py, fla/ops/__init__.py).
+    Many of these fail with triton incompatibilities or missing symbols.
+
+    Solution: pre-register fla, fla.layers, and fla.ops as minimal stub packages
+    (with correct __path__) so their __init__.py files are never executed.
+    Submodules like fla.layers.quasar, fla.ops.quasar, fla.ops.utils are still
+    found via __path__ and imported normally.
+    """
+    # First try normal import (works when fla is fully compatible)
+    try:
+        from fla.layers.quasar import QuasarAttention
+        return QuasarAttention
+    except (ImportError, AttributeError, AssertionError, RuntimeError):
+        pass
+
+    # Clean up failed partial imports
+    for key in list(sys.modules):
+        if key == "fla" or key.startswith("fla."):
+            del sys.modules[key]
+
+    # Find the fla package root on disk
+    import importlib.util
+    fla_spec = importlib.util.find_spec("fla")
+    if fla_spec is None:
+        raise ImportError("Cannot find fla package on sys.path")
+    fla_root = os.path.dirname(fla_spec.origin)
+
+    # Pre-register stub packages so their __init__.py files are NOT executed.
+    # Each stub has __path__ pointing to the real directory so submodules
+    # (fla.layers.quasar, fla.ops.quasar, fla.ops.utils, etc.) resolve normally.
+    stub_pkgs = {
+        "fla": fla_root,
+        "fla.layers": os.path.join(fla_root, "layers"),
+        "fla.ops": os.path.join(fla_root, "ops"),
+    }
+    for pkg_name, pkg_dir in stub_pkgs.items():
+        stub = types.ModuleType(pkg_name)
+        stub.__path__ = [pkg_dir]
+        stub.__file__ = os.path.join(pkg_dir, "__init__.py")
+        stub.__package__ = pkg_name
+        sys.modules[pkg_name] = stub
+
+    # Wire parent-child attributes
+    sys.modules["fla"].layers = sys.modules["fla.layers"]
+    sys.modules["fla"].ops = sys.modules["fla.ops"]
+
+    # Now import QuasarAttention — only its real dependencies are loaded
+    from fla.layers.quasar import QuasarAttention
+    return QuasarAttention
+
+QuasarAttention = _import_quasar_attention()
 
 def test_quasar_basic():
     print("Testing QuasarAttention basic functionality...")
@@ -115,22 +172,19 @@ def test_quasar_basic():
             
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else torch.no_grad():
                 output, _, _ = quasar(x)
-            
-            # Success - break out of retry loop
-            break
-        
+
             print(f"Output shape: {output.shape}")
             print("QuasarAttention basic test PASSED!")
-            
+
             # Cleanup after test
             del output, x, quasar
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 import gc
                 gc.collect()
-            
+
             return True
-            
+
         except torch.cuda.OutOfMemoryError as e:
             retry_count += 1
             print(f"CUDA OOM Error (attempt {retry_count}/{max_retries}): {e}")
