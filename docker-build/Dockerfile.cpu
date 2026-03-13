@@ -1,0 +1,30 @@
+# QUASAR Miner CPU Inference Image (for Render / CPU-only servers)
+#
+# All dependencies installed at BUILD time — no network needed at runtime.
+#
+# Build:
+#   docker build -f Dockerfile.cpu -t quasar-miner-cpu:latest .
+
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+COPY miner/requirements.inference.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY miner/inference_server.py .
+
+ENV MODEL_NAME="Qwen/Qwen3-4B-Instruct-2507"
+ENV DEVICE="cpu"
+ENV HOST="0.0.0.0"
+ENV PORT=8000
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+CMD ["python", "inference_server.py"]

@@ -45,7 +45,7 @@ COPY inference_server.py .
 
 # Environment variables for configuration
 # Override MODEL_NAME to use your optimized model
-ENV MODEL_NAME="Qwen/Qwen2.5-0.5B-Instruct"
+ENV MODEL_NAME="Qwen/Qwen3-4B-Instruct-2507"
 ENV DEVICE="cuda"
 ENV HOST="0.0.0.0"
 ENV PORT=8000

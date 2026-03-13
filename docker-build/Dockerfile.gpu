@@ -1,0 +1,41 @@
+# QUASAR Miner GPU Inference Image
+#
+# All dependencies are installed at BUILD time so the container works
+# in network-isolated environments (validators run containers on an
+# internal-only Docker network with no internet access).
+#
+# Build:
+#   docker build -f Dockerfile.gpu -t quasar-miner-gpu:latest .
+#
+# Push without Docker daemon (RunPod):
+#   See push_miner.sh
+
+ARG CUDA_VERSION=12.2.0
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY miner/requirements.inference.txt requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+COPY miner/inference_server.py .
+
+ENV MODEL_NAME="Qwen/Qwen3-4B-Instruct-2507"
+ENV DEVICE="cuda"
+ENV HOST="0.0.0.0"
+ENV PORT=8000
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -sf http://localhost:8000/health || exit 1
+
+CMD ["python3", "inference_server.py"]

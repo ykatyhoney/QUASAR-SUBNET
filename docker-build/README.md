@@ -1,27 +1,17 @@
-# Docker Build (Bazel)
+# Docker Build
 
-Build and push QUASAR miner inference Docker images using [Bazel](https://bazel.build) + [rules_oci](https://github.com/bazel-contrib/rules_oci).
+Build and push QUASAR miner inference Docker images.
 
-This approach uses `crane` to push images directly to Docker Hub **without requiring a Docker daemon**. This is essential for environments like RunPod where `docker run` / `docker build` are not available.
+**Important:** All dependencies (python3, pip packages, curl) are installed at **build time**. Validator containers run on an isolated network with no internet access, so runtime package installation will fail.
 
 ## Prerequisites
 
 - **Docker Hub account** with an access token ([create one here](https://hub.docker.com/settings/security))
-- **Bazel** (via Bazelisk):
-
-  ```bash
-  wget https://github.com/bazelbuild/bazelisk/releases/download/v1.28.1/bazelisk-linux-amd64
-  chmod +x bazelisk-linux-amd64
-  sudo cp bazelisk-linux-amd64 /usr/local/bin/bazel
-  ```
-
+- **Docker** installed (or Bazel + crane for daemon-less environments)
 - **Docker Hub credentials** in `~/.docker/config.json`:
 
   ```bash
-  mkdir -p ~/.docker
-  echo 'YOUR_ACCESS_TOKEN' | docker login -u YOUR_USERNAME --password-stdin 2>/dev/null || \
-    printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}' \
-      "$(echo -n 'YOUR_USERNAME:YOUR_ACCESS_TOKEN' | base64)" > ~/.docker/config.json
+  echo 'YOUR_ACCESS_TOKEN' | docker login -u YOUR_USERNAME --password-stdin
   ```
 
 - **`DOCKER_USERNAME`** set in the project `.env` file:
@@ -35,78 +25,80 @@ This approach uses `crane` to push images directly to Docker Hub **without requi
 
 ```bash
 cd docker-build
-bash push_miner.sh
+bash push_miner.sh gpu
 ```
 
-This interactive script will:
-1. Load `DOCKER_USERNAME` from `.env`
-2. Update `docker_config.bzl`
-3. Let you choose GPU, CPU, or both images
-4. Build and push to Docker Hub
+## Build Methods
 
-## Manual Build
+### Method 1: Docker (recommended)
+
+Uses `Dockerfile.gpu` / `Dockerfile.cpu` to build proper images with all dependencies pre-installed.
+
+```bash
+# From repo root
+docker build -f docker-build/Dockerfile.gpu -t $DOCKER_USERNAME/quasar-miner-gpu:latest .
+docker push $DOCKER_USERNAME/quasar-miner-gpu:latest
+```
+
+Or use the script:
 
 ```bash
 cd docker-build
+bash push_miner.sh gpu   # or cpu, both
+```
 
-# Update Bazel config from .env
-bash load_config_from_env.sh
+### Method 2: Bazel + crane (RunPod / no Docker daemon)
 
-# Push GPU image (for RunPod / CUDA environments)
-bazel run //:push_miner_image_gpu
+For environments without a Docker daemon. Requires a pre-built base image that already includes python3 and pip dependencies.
 
-# Push CPU image (for Render / CPU environments)
-bazel run //:push_miner_image_cpu
+```bash
+BUILDER=crane ./push_miner.sh gpu
 ```
 
 ## What Gets Built
 
 | Target | Image Name | Base Image | Use Case |
 |--------|-----------|------------|----------|
-| `push_miner_image_gpu` | `<DOCKER_USERNAME>/quasar-miner-gpu:latest` | `nvidia/cuda:12.1.0-runtime-ubuntu22.04` | RunPod, GPU servers |
-| `push_miner_image_cpu` | `<DOCKER_USERNAME>/quasar-miner-cpu:latest` | `python:3.10-slim` | Render, CPU servers |
+| GPU | `<USER>/quasar-miner-gpu:latest` | `nvidia/cuda:12.2.0-runtime-ubuntu22.04` | RunPod, GPU servers |
+| CPU | `<USER>/quasar-miner-cpu:latest` | `python:3.10-slim` | Render, CPU servers |
 
 Both images include:
 - `miner/inference_server.py` — the FastAPI inference server
-- `miner/requirements.inference.txt` — Python dependencies
+- All Python dependencies pre-installed (torch, transformers, fastapi, etc.)
 - Environment: `MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507`, `PYTHONUNBUFFERED=1`
+
+## Why Build-Time Installation Matters
+
+Validators run miner containers in a **sandboxed environment**:
+- Read-only root filesystem
+- Internal-only Docker network (no internet)
+- Dropped Linux capabilities
+
+If your image tries to `apt-get install` or `pip install` at startup, it will fail with DNS resolution errors and your submission will score 0. Everything must be pre-installed in the image.
 
 ## File Structure
 
 ```
 docker-build/
-├── BUILD.bazel              # Image definitions and push targets
-├── WORKSPACE                # External dependencies (rules_oci, base images)
-├── MODULE.bazel             # Bazel module declaration
-├── .bazelversion            # Pins Bazel to 7.4.1
-├── docker_config.bzl        # Auto-generated: DOCKER_USERNAME (from .env)
-├── load_config_from_env.sh  # Generates docker_config.bzl from .env
-├── push_miner.sh            # Interactive build+push script
-└── miner/
-    ├── BUILD.bazel              # Exports inference server files
-    ├── inference_server.py      # Miner inference server source
-    └── requirements.inference.txt  # Python dependencies
+├── Dockerfile.gpu          # GPU image (recommended build method)
+├── Dockerfile.cpu          # CPU image (recommended build method)
+├── BUILD.bazel             # Bazel image definitions (crane-based push)
+├── WORKSPACE               # External dependencies (rules_oci, base images)
+├── push_miner.sh           # Build + push script (supports docker & crane)
+├── load_config_from_env.sh # Generates docker_config.bzl from .env
+└── docker_config.bzl       # Auto-generated: DOCKER_USERNAME
 ```
 
-## Local Testing (without pushing)
-
-Create a local tarball for testing:
+## Local Testing
 
 ```bash
-bazel build //:quasar_miner_tarball_gpu
-# Output: bazel-bin/quasar_miner_tarball_gpu/tarball.tar
+# Build locally
+docker build -f docker-build/Dockerfile.gpu -t quasar-miner-gpu:latest .
 
-# Load into local Docker (requires Docker daemon)
-docker load < bazel-bin/quasar_miner_tarball_gpu/tarball.tar
+# Test
 docker run --gpus all -p 8001:8000 quasar-miner-gpu:latest
+curl http://localhost:8001/health
 ```
-
-## How It Works
-
-1. `load_config_from_env.sh` reads `DOCKER_USERNAME` from `.env` and writes `docker_config.bzl`
-2. `BUILD.bazel` uses `oci_image` to layer the miner files onto a base image
-3. `oci_push` uses `crane` (not Docker) to push the built image to Docker Hub
-4. The miner neuron (`neurons/miner.py`) includes the image name in submissions so validators can pull it
 
 ## Relationship to Miner
 
