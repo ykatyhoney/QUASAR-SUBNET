@@ -117,6 +117,9 @@ else
     echo "   Continuing anyway..."
 fi
 
+# CUDA memory management — must be set before PyTorch initializes
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # Check CUDA
 if python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
     echo "✅ CUDA is available"

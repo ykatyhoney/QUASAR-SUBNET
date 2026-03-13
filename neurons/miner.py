@@ -119,9 +119,9 @@ class Miner(BaseMinerNeuron):
             )
             self.agent_max_new_tokens = 2048  # Reduce for small models
         elif model_size >= 4.0:  # >= 4B
-            self.agent_max_new_tokens = 8192  # Increase for large models
+            self.agent_max_new_tokens = 4096
             print(
-                f"[MINER] Using large model ({self.model_name}, ~{model_size}B params). Increased max_new_tokens to {self.agent_max_new_tokens}",
+                f"[MINER] Using large model ({self.model_name}, ~{model_size}B params). max_new_tokens={self.agent_max_new_tokens}",
                 flush=True,
             )
         else:  # 1B - 4B
