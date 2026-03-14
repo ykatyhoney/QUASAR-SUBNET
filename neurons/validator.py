@@ -1425,6 +1425,15 @@ class Validator(BaseValidatorNeuron):
                 logits_at_steps=logits_at_steps,
             )
 
+            print(
+                f"[VALIDATOR]   Container result: success={miner_result.success}, "
+                f"tokens={len(miner_result.tokens)}, "
+                f"has_logits={miner_result.captured_logits is not None}, "
+                f"multi_steps={list(miner_result.captured_logits_multi.keys()) if miner_result.captured_logits_multi else []}, "
+                f"elapsed={miner_result.elapsed_sec:.2f}s",
+                flush=True,
+            )
+
             if not miner_result.success:
                 print(
                     f"[VALIDATOR]   Container execution failed: {miner_result.error}",
@@ -1719,6 +1728,16 @@ class Validator(BaseValidatorNeuron):
 
                         # Logit verification is mandatory: only True passes
                         if verification_result.get("verified") == True:
+                            cosine = verification_result.get("cosine_similarity", "N/A")
+                            max_diff = verification_result.get("max_abs_diff", "N/A")
+                            steps = verification_result.get("steps_checked", "?")
+                            m_tps = verification_result.get("miner_throughput", 0)
+                            print(
+                                f"[VALIDATOR] ✅ Logit verification PASSED "
+                                f"({steps} steps, cosine={cosine}, max_diff={max_diff}, "
+                                f"container_tps={m_tps:.1f})",
+                                flush=True,
+                            )
                             evaluated_scores[miner_hotkey] = normalized_score
                         else:
                             status = (
@@ -1726,10 +1745,24 @@ class Validator(BaseValidatorNeuron):
                                 if verification_result.get("verified") == False
                                 else "NOT RUN"
                             )
+                            reason = verification_result.get("reason", "unknown")
+                            cosine = verification_result.get("cosine_similarity", "N/A")
+                            max_diff = verification_result.get("max_abs_diff", "N/A")
+                            steps = verification_result.get("steps_checked", 0)
                             print(
                                 f"[VALIDATOR] ❌ Logit verification {status} - score set to 0",
                                 flush=True,
                             )
+                            print(
+                                f"[VALIDATOR]   Reason: {reason}",
+                                flush=True,
+                            )
+                            if cosine != "N/A" or max_diff != "N/A":
+                                print(
+                                    f"[VALIDATOR]   Details: steps_checked={steps}, "
+                                    f"cosine={cosine}, max_diff={max_diff}",
+                                    flush=True,
+                                )
                             normalized_score = 0.0
                             evaluated_scores[miner_hotkey] = 0.0
                     else:

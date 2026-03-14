@@ -743,10 +743,27 @@ def run_container_inference(
         }
         if logits_at_steps:
             payload["logits_at_steps"] = logits_at_steps
-        log(f"Calling /inference (timeout={timeout}s)...", "info")
+        log(f"Calling /inference (prompt={len(prompt)} tokens, gen_len={gen_len}, "
+            f"capture_steps={logits_at_steps}, timeout={timeout}s)...", "info")
         wall_start = time.perf_counter()
-        resp = _requests.post(inference_url, json=payload, timeout=timeout)
+        try:
+            resp = _requests.post(inference_url, json=payload, timeout=timeout)
+        except _requests.exceptions.Timeout:
+            wall_elapsed = time.perf_counter() - wall_start
+            log(f"/inference timed out after {wall_elapsed:.1f}s (limit={timeout}s)", "error")
+            return ContainerInferenceResult(
+                success=False,
+                error=f"/inference timed out after {wall_elapsed:.1f}s",
+            )
+        except _requests.exceptions.ConnectionError as conn_err:
+            wall_elapsed = time.perf_counter() - wall_start
+            log(f"/inference connection error after {wall_elapsed:.1f}s: {conn_err}", "error")
+            return ContainerInferenceResult(
+                success=False,
+                error=f"/inference connection error: {conn_err}",
+            )
         wall_elapsed = time.perf_counter() - wall_start
+        log(f"/inference responded: HTTP {resp.status_code} in {wall_elapsed:.2f}s", "info")
         if resp.status_code != 200:
             return ContainerInferenceResult(
                 success=False,
@@ -754,6 +771,11 @@ def run_container_inference(
             )
 
         data = resp.json()
+        log(f"Response keys: {list(data.keys())}, "
+            f"tokens={len(data.get('tokens', []))}, "
+            f"has_captured_logits={'captured_logits' in data and data['captured_logits'] is not None}, "
+            f"has_multi={bool(data.get('captured_logits_multi'))}, "
+            f"multi_steps={list(data['captured_logits_multi'].keys()) if isinstance(data.get('captured_logits_multi'), dict) else []}", "info")
         miner_claimed_sec = float(data.get("elapsed_sec", 0))
         # Use validator-measured wall time, not the miner's self-reported value.
         # Wall time includes HTTP overhead (~ms), but that's a conservative
@@ -791,7 +813,9 @@ def run_container_inference(
         return result
 
     except Exception as e:
+        import traceback
         log(f"Container execution failed for {hotkey[:8]}...: {e}", "error")
+        log(f"Traceback: {traceback.format_exc()}", "error")
         return ContainerInferenceResult(success=False, error=str(e))
     finally:
         if container is not None:
