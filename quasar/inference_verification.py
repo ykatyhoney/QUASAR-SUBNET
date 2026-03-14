@@ -96,7 +96,7 @@ def log(msg: str, level: str = "info"):
         "warn": "\033[33m\u26a0\033[0m",      # Yellow
         "start": "\033[33m\u2192\033[0m",     # Yellow arrow
     }
-    print(f"\033[90m{ts}\033[0m {colors.get(level, ' ')} {msg}")
+    print(f"\033[90m{ts}\033[0m {colors.get(level, ' ')} {msg}", flush=True)
 
 
 def log_header(title: str):
