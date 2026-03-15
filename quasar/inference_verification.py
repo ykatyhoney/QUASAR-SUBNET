@@ -662,28 +662,13 @@ def run_container_inference(
                 success=False, error=f"docker pull failed: {e}"
             )
 
-        # 2. Network isolation.
-        #    Start on the default bridge so host port-mapping always works,
-        #    then attach to an internal-only network and disconnect from
-        #    the bridge.  This guarantees the validator can reach the
-        #    container via the mapped port while the container itself has
-        #    no outbound internet access.
-        _INTERNAL_NET_NAME = "quasar-verify-internal"
-        try:
-            verify_network = client.networks.get(_INTERNAL_NET_NAME)
-        except _docker.errors.NotFound:
-            verify_network = client.networks.create(
-                _INTERNAL_NET_NAME,
-                driver="bridge",
-                internal=True,
-            )
-            log(f"Created internal Docker network: {_INTERNAL_NET_NAME}", "info")
+        # 2. Network: use the default bridge so host port-mapping works
+        #    reliably across all Docker versions.  Container security is
+        #    enforced by read_only, cap_drop ALL, no-new-privileges, and
+        #    pids_limit — the container cannot persist data or escalate
+        #    privileges even if it reaches the network.
 
         # 3. Start container with security hardening
-        #    NOTE: We do NOT set "network" here so the container starts on
-        #    the default bridge (port mapping requires it on some Docker
-        #    versions).  After start we attach the internal network and
-        #    disconnect the bridge to block internet access.
         run_kwargs: Dict[str, Any] = {
             "image": docker_image,
             "detach": True,
@@ -734,17 +719,6 @@ def run_container_inference(
 
         log(f"Starting container on host port {host_port}...", "start")
         container = client.containers.run(**run_kwargs)
-
-        # 3b. Swap networks: attach internal, disconnect default bridge.
-        #     Port mapping stays active because Docker binds it at
-        #     container creation time (before network changes).
-        try:
-            verify_network.connect(container)
-            default_bridge = client.networks.get("bridge")
-            default_bridge.disconnect(container)
-            log("Swapped to internal network (bridge disconnected)", "info")
-        except Exception as net_err:
-            log(f"Network swap warning (continuing): {net_err}", "warn")
 
         # 4. Wait for health
         log("Waiting for container health...", "info")
