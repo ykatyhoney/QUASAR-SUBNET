@@ -570,18 +570,34 @@ def _wait_for_container_health(
     url = f"http://127.0.0.1:{host_port}/health"
     deadline = time.time() + timeout
     last_err = None
+    attempt = 0
+    log(f"Health-check polling {url} (timeout={timeout}s, interval={poll_interval}s)", "info")
     while time.time() < deadline:
+        attempt += 1
         try:
             r = _requests.get(url, timeout=5)
             if r.status_code == 200:
-                data = r.json()
-                if data.get("status") == "healthy":
+                try:
+                    data = r.json()
+                except Exception as je:
+                    log(f"Health-check attempt {attempt}: HTTP 200 but JSON parse failed: {je} | raw={r.text[:200]}", "warn")
+                    time.sleep(poll_interval)
+                    continue
+                status_val = data.get("status")
+                if status_val == "healthy":
+                    log(f"Health-check passed on attempt {attempt} ({time.time() - (deadline - timeout):.1f}s elapsed)", "success")
                     return True
+                else:
+                    log(f"Health-check attempt {attempt}: HTTP 200 but status={status_val!r} (expected 'healthy')", "warn")
+            else:
+                log(f"Health-check attempt {attempt}: HTTP {r.status_code} | body={r.text[:200]}", "warn")
         except Exception as e:
             last_err = e
+            if attempt <= 3 or attempt % 10 == 0:
+                log(f"Health-check attempt {attempt}: {type(e).__name__}: {e}", "warn")
         time.sleep(poll_interval)
-    if last_err:
-        log(f"Last health-check error: {last_err}", "warn")
+    elapsed = timeout - (deadline - time.time())
+    log(f"Health-check FAILED after {attempt} attempts ({elapsed:.0f}s). Last error: {last_err}", "error")
     return False
 
 
@@ -646,10 +662,12 @@ def run_container_inference(
                 success=False, error=f"docker pull failed: {e}"
             )
 
-        # 2. Create / reuse an internal Docker network.
-        #    "internal=True" blocks all outbound internet access while
-        #    still allowing the validator to reach the container via the
-        #    mapped port on the host.
+        # 2. Network isolation.
+        #    Start on the default bridge so host port-mapping always works,
+        #    then attach to an internal-only network and disconnect from
+        #    the bridge.  This guarantees the validator can reach the
+        #    container via the mapped port while the container itself has
+        #    no outbound internet access.
         _INTERNAL_NET_NAME = "quasar-verify-internal"
         try:
             verify_network = client.networks.get(_INTERNAL_NET_NAME)
@@ -662,6 +680,10 @@ def run_container_inference(
             log(f"Created internal Docker network: {_INTERNAL_NET_NAME}", "info")
 
         # 3. Start container with security hardening
+        #    NOTE: We do NOT set "network" here so the container starts on
+        #    the default bridge (port mapping requires it on some Docker
+        #    versions).  After start we attach the internal network and
+        #    disconnect the bridge to block internet access.
         run_kwargs: Dict[str, Any] = {
             "image": docker_image,
             "detach": True,
@@ -676,9 +698,6 @@ def run_container_inference(
             },
             "name": f"quasar-verify-{hotkey[:12]}-{int(time.time())}",
             # --- Security hardening ---
-            # Internal network: container can serve on the mapped port
-            # but CANNOT reach the internet or LAN.
-            "network": verify_network.name,
             "cap_drop": ["ALL"],
             # Re-add only the minimum capabilities needed for GPU,
             # serving on the mapped port, and common container runtimes
@@ -715,6 +734,17 @@ def run_container_inference(
 
         log(f"Starting container on host port {host_port}...", "start")
         container = client.containers.run(**run_kwargs)
+
+        # 3b. Swap networks: attach internal, disconnect default bridge.
+        #     Port mapping stays active because Docker binds it at
+        #     container creation time (before network changes).
+        try:
+            verify_network.connect(container)
+            default_bridge = client.networks.get("bridge")
+            default_bridge.disconnect(container)
+            log("Swapped to internal network (bridge disconnected)", "info")
+        except Exception as net_err:
+            log(f"Network swap warning (continuing): {net_err}", "warn")
 
         # 4. Wait for health
         log("Waiting for container health...", "info")
