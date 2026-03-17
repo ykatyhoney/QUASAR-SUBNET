@@ -7,33 +7,31 @@
 [![QUASAR](./banner.png)](https://github.com/SILX-LABS/QUASAR-SUBNET)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+| | |
+|---|---|
+| **Subnet UID** | `24` (mainnet) / `383` (testnet) |
+| **Network** | `finney` |
+| **Validator API** | `https://quasar-validator-api.onrender.com` |
+| **Reference Model** | `Qwen/Qwen3-4B-Instruct-2507` |
+
 </div>
 
 ---
 
 - [Overview](#overview)
+- [Validator Operation](#validator-operation)
+  - [Requirements](#validator-requirements)
+  - [Setup](#validator-setup)
+  - [Running](#running-the-validator)
+- [Miner Operation](#miner-operation)
+  - [Requirements](#miner-requirements)
+  - [Setup](#miner-setup)
+  - [Running](#running-the-miner)
+  - [BYOC Mode (Bring Your Own Code)](#byoc-mode-bring-your-own-code)
+- [Reward Distribution](#reward-distribution)
 - [Architecture](#architecture)
-  - [Validator API](#validator-api)
-  - [Miner Neuron](#miner-neuron)
-    - [BYOC Mode (Bring Your Own Code)](#byoc-mode-bring-your-own-code)
-  - [Validator Neuron](#validator-neuron)
-  - [Miner Inference Server](#miner-inference-server)
-- [Quick Start](#quick-start)
-  - [Environment Setup](#environment-setup)
-  - [Miner Setup (RunPod or any GPU)](#miner-setup-runpod-or-any-gpu)
-  - [Validator Setup (Vast.ai, Lambda, AWS — Docker required)](#validator-setup-vastai-lambda-aws--docker-required)
-  - [Ports & Conflicts](#ports--conflicts)
-- [Docker & Image Publishing](#docker--image-publishing)
-  - [Miner: Build & Push with Bazel (RunPod)](#miner-build--push-with-bazel-runpod)
-  - [Miner: Manual Docker Build (Local)](#miner-manual-docker-build-local)
-  - [Validator: Sandbox Image](#validator-sandbox-image)
 - [Key Environment Variables](#key-environment-variables)
-- [Scoring Model](#scoring-model)
-  - [Validator-Measured TPS](#validator-measured-tps-no-claimed-tps-gate)
-  - [GPU Normalization](#gpu-normalization)
-  - [Recommended GPU Hardware](#recommended-gpu-hardware)
-- [GPU Hosting Compatibility](#gpu-hosting-compatibility)
-- [Required Imports (Critical!)](#required-imports-critical)
+- [GPU Hardware & Hosting](#gpu-hardware--hosting)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
 - [License](#license)
@@ -42,136 +40,53 @@
 
 ## Overview
 
-QUASAR-SUBNET is a Bittensor subnet that:
+QUASAR-SUBNET is a Bittensor subnet where miners compete to optimize **flash-linear attention kernels** and validators verify performance via sandboxed benchmarks and logit-level inference checks.
 
-- Optimizes **flash-linear attention kernels** via miner submissions
-- Uses a centralized **Validator API** to orchestrate rounds, commit–reveal, and scoring
-- Verifies miner behavior via a **logit-level inference verification** protocol
-- Supports both **local miners** and **Docker-based miner inference servers**
+**Miners** fork a target repository, optimize kernel code, and submit results. The validator measures actual throughput (tokens/sec) in a sandboxed Docker container and verifies correctness via logit comparison against a reference model.
 
-Miners:
-- Fork and optimize a target repository (e.g. `troy12x/flash-linear-attention`)
-- Run kernel benchmarks and report results to the Validator API
-- Expose an HTTP inference server (locally or via Docker) for logit verification
-- Build and push a Docker image to Docker Hub so validators can verify logits
-
-Validators:
-- Coordinate benchmarking rounds through the Validator API
-- Run miner kernel code inside a **sandboxed Docker container** for performance testing
-- Verify miner outputs using **logit verification** against a reference model
-- Submit final weights to the Bittensor network
+**Validators** pull competition weights from the centralized Validator API and set them on the Bittensor chain. They also run the sandboxed benchmark and logit verification pipeline for pending submissions.
 
 ---
 
-## Architecture
+## Validator Operation
 
-### Validator API
+### Validator Requirements
 
-Location: `validator_api/`
-Entry point: `validator_api/app.py`
+- **GPU**: RTX 5090 or RTX 6000 Pro recommended (48GB VRAM ideal)
+- **Docker**: Full Docker daemon with NVIDIA Container Toolkit (not RunPod)
+- **Bittensor wallet**: Registered on subnet 24 with sufficient stake
+- **OS**: Ubuntu 22.04+ recommended
 
-- Central FastAPI service used by miners and validators
-- Stores benchmark results, commit–reveal state, and miner metadata
-- Backed by PostgreSQL or SQLite via `DATABASE_URL`
-- Deployed in production using Docker/Render (see `render.yaml` and `Dockerfile`)
-
-Local startup:
+### Validator Setup
 
 ```bash
-./START_SERVER.sh
+# 1. Clone and install
+git clone https://github.com/SILX-LABS/QUASAR-SUBNET
+cd QUASAR-SUBNET
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install -e .
+
+# 2. Configure environment
+cp .env.example .env
 ```
 
-Health check:
+Edit `.env` with your values:
 
 ```bash
-curl http://localhost:8000/health
+NETUID=24
+SUBTENSOR_NETWORK=finney
+WALLET_VALIDATOR_NAME=your_validator_wallet
+WALLET_HOTKEY=default
+VALIDATOR_API_URL=https://quasar-validator-api.onrender.com
+ENABLE_LOGIT_VERIFICATION=true
+REFERENCE_MODEL=Qwen/Qwen3-4B-Instruct-2507
 ```
 
-### Miner Neuron
-
-Location: `neurons/miner.py`
-Role: Bittensor neuron that:
-
-- Connects to the Bittensor network (`--subtensor.network`, `--netuid`)
-- Forks the target GitHub repo using `GITHUB_TOKEN` and `GITHUB_USERNAME`
-- Runs optimization loops on `chunk.py` and related kernels
-- Submits results (including `docker_image`) to the Validator API
-- Optionally runs in **test mode** for local development
-
-Typical local run (using `.env`):
-
 ```bash
-./START_MINER.sh
-```
-
-Under the hood this is equivalent to:
-
-```bash
-python -m neurons.miner \
-  --wallet.name "$WALLET_MINER_NAME" \
-  --wallet.hotkey "$WALLET_HOTKEY" \
-  --subtensor.network "$SUBTENSOR_NETWORK" \
-  --netuid "$NETUID"
-```
-
-> **Note**: The miner requires `GITHUB_TOKEN` (with `repo` scope) and `GITHUB_USERNAME` in `.env`.
-
-#### Docker Image for Logit Verification
-
-Miners **must** build and push a Docker image containing their inference server so validators can verify logits. Set `DOCKER_USERNAME` in `.env` and the miner will automatically include `<DOCKER_USERNAME>/quasar-miner-gpu:latest` as the `docker_image` in submissions. Without this, logit verification will fail.
-
-Build & push:
-
-```bash
-cd docker-build && bash push_miner.sh
-```
-
-#### BYOC Mode (Bring Your Own Code)
-
-Two BYOC modes are available:
-
-**BYOC Reference** — LLM uses your code as a reference to guide optimization:
-
-```bash
-BYOC_FILE_PATH=./my_chunk.py ./START_MINER.sh
-```
-
-**BYOC Direct** — Skip the LLM entirely, submit your code directly (no GPU needed for code gen):
-
-```bash
-# Single file
-BYOC_DIRECT=true BYOC_FILE_PATH=./my_chunk.py ./START_MINER.sh
-
-# Directory with multiple target files
-BYOC_DIRECT=true BYOC_DIR=./my_kernels/ ./START_MINER.sh
-```
-
-BYOC Direct will: copy your files into the fork, validate imports, run benchmarks, commit+push to GitHub, and submit to the Validator API.
-
-**Tips**:
-
-- Make sure your code includes all [required imports](#required-imports-critical) or the validator will reject with score 0.0
-- Use absolute paths for `BYOC_FILE_PATH` / `BYOC_DIR`
-- Target files: `chunk.py`, `fused_recurrent.py`, `gate.py`, `forward_substitution.py`, `chunk_intra_token_parallel.py`, `__init__.py`
-
-### Validator Neuron
-
-Location: `neurons/validator.py`
-Role: Bittensor neuron that:
-
-- Polls the Validator API for new submissions
-- Validates miner code, imports, and kernel behavior
-- Runs benchmark tasks inside a **sandboxed Docker container** (`quasar-sandbox:latest`)
-- Verifies miner outputs using **logit verification** against a reference model
-- Queries the actual Bittensor chain for block numbers (with time-based fallback)
-
-**Prerequisites** (on the validator machine — requires full Docker support):
-
-```bash
-# 1. Build the sandbox image for miner code benchmarking
-docker build -t quasar-sandbox:latest -f validator/Dockerfile.sandbox .
-
-# 2. Install NVIDIA Container Toolkit (if not already installed)
+# 3. Install NVIDIA Container Toolkit (if not already installed)
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
   gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
@@ -181,273 +96,117 @@ apt-get update && apt-get install -y nvidia-container-toolkit
 nvidia-ctk runtime configure --runtime=docker
 systemctl restart docker
 
-# 3. Verify GPU passthrough works
+# 4. Verify GPU passthrough
 docker run --rm --gpus all nvidia/cuda:12.1.0-runtime-ubuntu22.04 nvidia-smi
+
+# 5. Build the sandbox image (one-time)
+docker build -t quasar-sandbox:latest -f validator/Dockerfile.sandbox .
 ```
 
-Without the sandbox image, all performance tests will fail with `pull access denied`.
-
-Local run (using `.env`):
+### Running the Validator
 
 ```bash
 ./START_VALIDATOR.sh
 ```
 
-### Miner Inference Server
+This runs `neurons/validator.py` which, on each cycle:
 
-Location (Python): `miner/inference_server.py`
-Location (Docker build): `docker-build/` and `miner/Dockerfile.inference`
+1. Syncs metagraph UIDs with the Validator API
+2. Fetches pending submissions and validates them (clone repo, benchmark in sandbox, verify logits)
+3. Pulls competition weights from `/get_weights`
+4. Sets weights on the Bittensor chain via `set_weights()`
+5. Sleeps for the polling interval (default 300s) and repeats
 
-This server exposes the **logit verification** interface:
-
-- `POST /inference` – runs generation & returns captured logits at multiple decoding steps
-- `GET /health` – health check
-- `GET /model_info` – basic metadata
-
-Local dev startup (bound to port 8001 to avoid conflicts):
-
-```bash
-./START_MINER_INFERENCE.sh
-```
-
-Containerized startup (built image):
-
-```bash
-docker run -d --gpus all -p 8001:8000 \
-  -e MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507 \
-  your_dockerhub_username/quasar-miner-gpu:latest
-```
+The validator needs its hotkey to be authorized on the Validator API. Contact the subnet owner to have your hotkey added to the production `VALIDATOR_HOTKEYS`.
 
 ---
 
-## Quick Start
+## Miner Operation
 
-### Environment Setup
+### Miner Requirements
+
+- **GPU**: RTX 5090 recommended (CUDA required for kernel optimization)
+- **GitHub account**: Personal Access Token with `repo` scope
+- **Docker Hub account**: For pushing the inference server image
+- **Bittensor wallet**: Registered on subnet 24
+
+### Miner Setup
 
 ```bash
+# 1. Clone and install
 git clone https://github.com/SILX-LABS/QUASAR-SUBNET
 cd QUASAR-SUBNET
-
 python -m venv .venv
 source .venv/bin/activate
-
 pip install --upgrade pip
 pip install -r requirements.txt
 pip install -e .
-```
 
-**Set up environment variables**:
-
-```bash
+# 2. Configure environment
 cp .env.example .env
-# Edit .env and fill in your values (see Key Environment Variables below)
 ```
 
-### Miner Setup (RunPod or any GPU)
-
-Miners do **not** need Docker running. They run Python directly and use Bazel to push images.
+Edit `.env` with your values:
 
 ```bash
-# Terminal 1: Start the miner inference server
+NETUID=24
+SUBTENSOR_NETWORK=finney
+WALLET_MINER_NAME=your_miner_wallet
+WALLET_HOTKEY=default
+GITHUB_TOKEN=ghp_your_token_here
+GITHUB_USERNAME=your_github_username
+DOCKER_USERNAME=your_dockerhub_username
+TARGET_SEQUENCE_LENGTH=100000
+```
+
+```bash
+# 3. Build and push Docker image for logit verification (one-time)
+cd docker-build && bash push_miner.sh && cd ..
+```
+
+Without the Docker image, logit verification will fail and your submissions will not rank.
+
+### Running the Miner
+
+```bash
+# Terminal 1: Start the inference server (for logit verification)
 ./START_MINER_INFERENCE.sh
 
 # Terminal 2: Start the miner neuron
 ./START_MINER.sh
-
-# One-time: Build & push Docker image for logit verification
-cd docker-build && bash push_miner.sh
 ```
 
-### Validator Setup (Vast.ai, Lambda, AWS — Docker required)
+The miner neuron will:
 
-Validators **must** run on a machine with full Docker support (not RunPod).
+1. Fork the target repository (`flash-linear-attention`) to your GitHub
+2. Run optimization loops on kernel code using an LLM agent
+3. Benchmark each iteration locally
+4. Submit results (commit hash, TPS, Docker image) to the Validator API
+5. Wait for the optimization interval (default 300s) and repeat
+
+### BYOC Mode (Bring Your Own Code)
+
+If you have your own optimized kernel code, skip the LLM agent and submit directly:
+
+**BYOC Reference** — LLM uses your code as a starting point:
 
 ```bash
-# One-time setup: Build sandbox image
-docker build -t quasar-sandbox:latest -f validator/Dockerfile.sandbox .
-
-# Terminal 1: Start the Validator API
-./START_SERVER.sh
-
-# Terminal 2: Start the validator neuron
-./START_VALIDATOR.sh
+BYOC_FILE_PATH=./my_chunk.py ./START_MINER.sh
 ```
 
-### Ports & Conflicts
-
-| Service                 | Default Port | Notes                              |
-|-------------------------|:------------:|------------------------------------|
-| Validator API           | `8000`       | Set via `PORT` env var             |
-| Miner Inference Server  | `8001`       | Set via `MINER_INFERENCE_PORT`     |
-| Challenge container     | `8080`       | From `docker-compose.yml`          |
-| Miner neuron axon       | auto/`8091`  | Set via `--axon.port`              |
-| Validator neuron axon   | auto/`8092`  | Set via `--axon.port`              |
-
-If you see `address already in use`, check which process is using the port (`lsof -i :8000`).
-
----
-
-## Docker & Image Publishing
-
-### Miner: Build & Push with Bazel (RunPod)
-
-Bazel uses `crane` to push images directly to Docker Hub — **no Docker daemon required**. This works on RunPod and any environment.
-
-1. Set `DOCKER_USERNAME` in `.env`
-2. Set up Docker Hub credentials:
-
-   ```bash
-   # Create ~/.docker/config.json for crane authentication
-   mkdir -p ~/.docker
-   echo 'YOUR_TOKEN' | docker login -u YOUR_USERNAME --password-stdin 2>/dev/null || \
-     printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}' \
-       "$(echo -n 'YOUR_USERNAME:YOUR_TOKEN' | base64)" > ~/.docker/config.json
-   ```
-
-3. Install Bazel (if not installed):
-
-   ```bash
-   wget https://github.com/bazelbuild/bazelisk/releases/download/v1.28.1/bazelisk-linux-amd64
-   chmod +x bazelisk-linux-amd64
-   sudo cp bazelisk-linux-amd64 /usr/local/bin/bazel
-   ```
-
-4. Build and push:
-
-   ```bash
-   cd docker-build
-   bash push_miner.sh
-   ```
-
-This pushes:
-- `index.docker.io/$DOCKER_USERNAME/quasar-miner-gpu:latest` (CUDA)
-- `index.docker.io/$DOCKER_USERNAME/quasar-miner-cpu:latest` (CPU)
-
-### Miner: Manual Docker Build (Local)
-
-If you have Docker available (not on RunPod):
+**BYOC Direct** — Submit your code directly (no LLM, no GPU needed for code gen):
 
 ```bash
-# GPU image (auto-detects CUDA version)
-cd miner && bash build_inference.sh
+# Single file
+BYOC_DIRECT=true BYOC_FILE_PATH=./my_chunk.py ./START_MINER.sh
 
-# Or manually
-docker build -f miner/Dockerfile.inference -t quasar-miner-gpu:latest miner/
-docker push your_username/quasar-miner-gpu:latest
+# Directory with multiple target files
+BYOC_DIRECT=true BYOC_DIR=./my_kernels/ ./START_MINER.sh
 ```
 
-### Validator: Sandbox Image
+Target files: `chunk.py`, `fused_recurrent.py`, `gate.py`, `forward_substitution.py`, `chunk_intra_token_parallel.py`, `__init__.py`
 
-The validator runs miner kernel code inside a sandboxed Docker container. Build this once on the validator machine:
-
-```bash
-docker build -t quasar-sandbox:latest -f validator/Dockerfile.sandbox .
-```
-
-The sandbox image contains Python 3.11, PyTorch (CUDA), Triton, and `flash-linear-attention`. Miner code is mounted read-only at `/workspace` at runtime.
-
----
-
-## Key Environment Variables
-
-Defined in `.env` (see `.env.example` for full documentation):
-
-| Variable                    | Default / Example                        | Used By      |
-|-----------------------------|------------------------------------------|--------------|
-| `DATABASE_URL`              | `postgresql://...` or `sqlite:///...`    | Validator API |
-| `VALIDATOR_API_URL`         | `https://quasar-validator-api.onrender.com` | All         |
-| `GITHUB_TOKEN`              | `ghp_...`                                | Miner        |
-| `GITHUB_USERNAME`           | `your_username`                          | Miner        |
-| `DOCKER_USERNAME`           | `your_dockerhub_username`                | Miner        |
-| `MINER_DOCKER_IMAGE`        | (auto: `<DOCKER_USERNAME>/quasar-miner-gpu:latest`) | Miner |
-| `NETUID`                    | `24`                                     | All neurons  |
-| `SUBTENSOR_NETWORK`         | `finney` / `test`                        | All neurons  |
-| `WALLET_MINER_NAME`         | `quasar_miner`                           | Miner        |
-| `WALLET_VALIDATOR_NAME`     | `quasar_validator`                       | Validator    |
-| `WALLET_HOTKEY`             | `default`                                | All neurons  |
-| `VALIDATOR_HOTKEYS`         | `hotkey1,hotkey2,...`                     | Validator API |
-| `ENABLE_LOGIT_VERIFICATION` | `true`                                   | Validator    |
-| `REFERENCE_MODEL`           | `Qwen/Qwen3-4B-Instruct-2507`           | Validator    |
-| `COSINE_SIM_THRESHOLD`      | `0.99`                                   | Validator    |
-| `MAX_ABS_DIFF_THRESHOLD`    | `0.1`                                    | Validator    |
-| `VALIDATOR_SANDBOX_IMAGE`   | `quasar-sandbox:latest`                  | Validator    |
-| `GPU_NORMALIZATION_FACTOR`  | (auto-detected)                          | Validator    |
-| `GPU_NORMALIZATION_FACTORS` | `{}`  (JSON overrides)                   | Validator    |
-| `MODEL_NAME`                | `Qwen/Qwen3-4B-Instruct-2507`           | Inference    |
-| `TARGET_SEQUENCE_LENGTH`    | `100000`                                 | Miner        |
-
----
-
-## Scoring Model
-
-### Validator-Measured TPS (No Claimed TPS Gate)
-
-Miners report `tokens_per_sec` when submitting, but this value is **informational only**. Scoring is based entirely on what the validator measures in its sandbox:
-
-1. Validator clones the miner's repo and runs the kernel in a sandboxed Docker container.
-2. The measured TPS is GPU-normalized to a reference baseline (see below).
-3. If the kernel produces valid output (TPS > 0) and passes logit verification, the submission is ranked.
-4. Rankings use `validated_tokens_per_sec` — the top 4 performers in each round receive rewards (60%/25%/10%/5%).
-
-This means miners are never penalized for running on different hardware than the validator. The validator's sandbox measurement is the single source of truth.
-
-### GPU Normalization
-
-Different validators may run on different GPUs. To ensure consistent scoring across the network, measured TPS is normalized to a **reference GPU baseline** (RTX 5090):
-
-```
-normalized_tps = measured_tps / gpu_normalization_factor
-```
-
-| GPU | Factor | Notes |
-|-----|:------:|-------|
-| RTX 5090 | 1.00 | Reference GPU |
-| RTX 6000 Pro (Blackwell) | 1.10 | Recommended for validators |
-| H100 80GB | 1.30 | Datacenter |
-| RTX 4090 | 0.65 | Previous gen consumer |
-| A100 80GB SXM | 0.75 | Datacenter (Ampere) |
-| A100 40GB | 0.70 | Datacenter (Ampere) |
-| L40S | 0.55 | Datacenter (Ada) |
-
-The validator auto-detects its GPU and applies the factor. Override with:
-
-```bash
-# Manual factor override
-GPU_NORMALIZATION_FACTOR=1.10
-
-# Or add custom GPU entries (JSON)
-GPU_NORMALIZATION_FACTORS='{"My Custom GPU": 0.85}'
-```
-
-See `quasar/gpu_normalization.py` for the full default table.
-
-### Recommended GPU Hardware
-
-| Role | Recommended GPU | Notes |
-|------|----------------|-------|
-| **Miner** | RTX 5090 | Optimize kernels for Blackwell architecture |
-| **Validator** | RTX 5090 or RTX 6000 Pro | RTX 6000 Pro has 48GB VRAM, ideal for running reference model + sandbox |
-
----
-
-## GPU Hosting Compatibility
-
-| Provider | Miner | Validator | Notes |
-|----------|:-----:|:---------:|-------|
-| **RunPod** | ✅ | ❌ | No Docker daemon — miners use Bazel to push, run Python directly |
-| **Vast.ai** | ✅ | ✅ | Full Docker support; sync clock with NTP (see [TROUBLESHOOTING.md](./TROUBLESHOOTING.md)) |
-| **Lambda Labs** | ✅ | ✅ | Full Docker and GPU support |
-| **AWS EC2 (GPU)** | ✅ | ✅ | Full VM with Docker |
-| **GCP GPU VMs** | ✅ | ✅ | Full VM with Docker |
-| **Paperspace Core** | ✅ | ✅ | VM-level access with Docker |
-
-**Key constraint**: Validators require `docker run` for sandboxed performance testing and logit verification. RunPod pods cannot run Docker containers (iptables blocked).
-
----
-
-## Required Imports (Critical!)
-
-The validator checks for these **MANDATORY** imports in `chunk.py`. Missing any of these will cause validation to fail with score 0.0:
+Your code **must** include these imports or the validator will reject it with score 0.0:
 
 ```python
 from fla.utils import autocast_custom_bwd
@@ -457,36 +216,144 @@ from fla.utils import check_shared_mem
 from fla.utils import input_guard
 ```
 
-If you're using BYOC mode, ensure your code includes all these imports.
+---
+
+## Reward Distribution
+
+Competition runs in **48-hour rounds**. At the end of each round, submissions are ranked by **validator-measured TPS** (not miner-claimed). The top 4 submissions receive rewards:
+
+| Rank | Reward Share |
+|:----:|:-----------:|
+| 1st | 60% |
+| 2nd | 25% |
+| 3rd | 10% |
+| 4th | 5% |
+
+**Ranking criteria** (in order):
+
+1. Logit verification must pass (mandatory)
+2. Weighted score = `validated_tokens_per_sec × league_multiplier` (descending)
+3. Submission timestamp (first submission wins ties)
+
+**League multipliers** by target sequence length:
+
+| Sequence Length | League | Multiplier |
+|:-:|:-:|:-:|
+| ≤ 100K | 100k | 0.5× |
+| ≤ 500K | 500k | 1.5× |
+| ≤ 1M | 1M | 3.0× |
+
+Validators set these weights on-chain. The Bittensor network distributes emissions proportionally to the weights set by staked validators.
+
+---
+
+## Architecture
+
+```
+┌─────────────┐     submit      ┌──────────────────┐     get_weights     ┌───────────────┐
+│    Miner     │ ──────────────► │   Validator API   │ ◄────────────────── │   Validator    │
+│ neurons/     │                 │ validator_api/     │                     │ neurons/       │
+│ miner.py     │                 │ app.py            │ ──── set_weights ──►│ validator.py   │
+└─────────────┘                 └──────────────────┘      (on-chain)      └───────────────┘
+       │                                │                                         │
+       │ push docker image              │ PostgreSQL                              │ sandbox benchmark
+       ▼                                │ (Supabase)                              │ + logit verification
+  Docker Hub                            │                                         ▼
+                                        └───────────────────────────────── Docker sandbox
+```
+
+- **Validator API** (`validator_api/app.py`): Central FastAPI service managing rounds, submissions, rankings, and weights. Deployed on Render with PostgreSQL.
+- **Miner Neuron** (`neurons/miner.py`): Optimizes kernels, benchmarks locally, submits to API.
+- **Validator Neuron** (`neurons/validator.py`): Validates submissions in Docker sandbox, verifies logits, pulls weights from API, sets weights on-chain.
+- **Miner Inference Server** (`miner/inference_server.py`): HTTP server for logit verification (`POST /inference`, `GET /health`).
+
+---
+
+## Key Environment Variables
+
+| Variable | Default | Used By | Description |
+|---|---|---|---|
+| `NETUID` | `24` | All | Subnet UID |
+| `SUBTENSOR_NETWORK` | `finney` | All | `finney` (mainnet) or `test` |
+| `VALIDATOR_API_URL` | `https://quasar-validator-api.onrender.com` | All | Central API endpoint |
+| `WALLET_MINER_NAME` | `quasar_miner` | Miner | Bittensor wallet name |
+| `WALLET_VALIDATOR_NAME` | `quasar_validator` | Validator | Bittensor wallet name |
+| `WALLET_HOTKEY` | `default` | All | Hotkey name |
+| `GITHUB_TOKEN` | — | Miner | GitHub PAT with `repo` scope |
+| `GITHUB_USERNAME` | — | Miner | GitHub username |
+| `DOCKER_USERNAME` | — | Miner | Docker Hub username |
+| `TARGET_SEQUENCE_LENGTH` | `100000` | Miner | Optimization target (affects league) |
+| `ENABLE_LOGIT_VERIFICATION` | `true` | Validator | Must be `true` for production |
+| `REFERENCE_MODEL` | `Qwen/Qwen3-4B-Instruct-2507` | Validator | Model for logit comparison |
+| `POLLING_INTERVAL` | `300` | Validator | Seconds between validation cycles |
+| `GPU_NORMALIZATION_FACTOR` | auto | Validator | Override auto-detected GPU factor |
+
+See `.env.example` for the full list with documentation.
+
+---
+
+## GPU Hardware & Hosting
+
+### Recommended GPUs
+
+| Role | GPU | Notes |
+|---|---|---|
+| **Miner** | RTX 5090 | Optimize kernels for Blackwell architecture |
+| **Validator** | RTX 5090 / RTX 6000 Pro | 48GB VRAM ideal for reference model + sandbox |
+
+### GPU Normalization
+
+Validator-measured TPS is normalized to a reference baseline so different hardware produces comparable scores:
+
+| GPU | Factor |
+|---|:---:|
+| RTX 5090 | 1.00 (reference) |
+| RTX 6000 Pro (Blackwell) | 1.10 |
+| H100 80GB | 1.30 |
+| RTX 4090 | 0.65 |
+| A100 80GB SXM | 0.75 |
+
+Override with `GPU_NORMALIZATION_FACTOR` in `.env`.
+
+### Hosting Compatibility
+
+| Provider | Miner | Validator | Notes |
+|---|:---:|:---:|---|
+| **RunPod** | ✅ | ❌ | No Docker daemon — miners use Bazel for image push |
+| **Vast.ai** | ✅ | ✅ | Full Docker; sync clock with NTP |
+| **Lambda Labs** | ✅ | ✅ | Full Docker and GPU support |
+| **AWS EC2** | ✅ | ✅ | Full VM with Docker |
+| **GCP GPU VMs** | ✅ | ✅ | Full VM with Docker |
+
+Validators **require** `docker run` for sandbox benchmarking. RunPod does not support this.
+
+### Ports
+
+| Service | Port | Env Var |
+|---|:---:|---|
+| Validator API | `8000` | `PORT` |
+| Miner Inference Server | `8001` | `MINER_INFERENCE_PORT` |
 
 ---
 
 ## Troubleshooting
 
-See [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) for detailed solutions to common issues including:
+See [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) for detailed solutions including:
 
 - Docker daemon errors on RunPod
 - Clock drift on Vast.ai causing 401 authentication errors
-- NVIDIA Container Toolkit setup for GPU passthrough
-- Sandbox container errors and debugging
+- NVIDIA Container Toolkit setup
+- Sandbox container errors
 
 ---
 
 ## Contributing
 
-We welcome contributions of all kinds:
-
-- Improving kernel optimization strategies
-- Enhancing validator scoring and metrics
-- Extending the inference verification pipeline
-- Docker and deployment improvements
-- Documentation and testing
-
-To contribute:
+We welcome contributions:
 
 1. Fork the repo and create a feature branch
 2. Make your changes with tests where applicable
-3. Open a PR with a clear description and rationale
+3. Open a PR with a clear description
 
 ---
 
