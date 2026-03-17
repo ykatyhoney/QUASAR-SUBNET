@@ -78,10 +78,12 @@ class CompetitionRound(Base):
     status = Column(String, default="active")  # "active", "evaluating", "completed"
     baseline_submission_id = Column(Integer, ForeignKey("speed_submissions.id"), nullable=True)
     winner_hotkey = Column(String, nullable=True)
+    winner_submission_id = Column(Integer, ForeignKey("speed_submissions.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
     baseline_submission = relationship("SpeedSubmission", foreign_keys=[baseline_submission_id], post_update=True)
+    winner_submission = relationship("SpeedSubmission", foreign_keys=[winner_submission_id], post_update=True)
     submissions = relationship("SpeedSubmission", back_populates="round", foreign_keys="SpeedSubmission.round_id")
 
 class IPBan(Base):

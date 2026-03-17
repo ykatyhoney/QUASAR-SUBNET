@@ -435,6 +435,29 @@ try:
                     )
                 )
                 conn.commit()
+            if cr_cols and "winner_submission_id" not in cr_cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE competition_rounds ADD COLUMN winner_submission_id INTEGER REFERENCES speed_submissions(id)"
+                    )
+                )
+                conn.commit()
+                conn.execute(
+                    text("""
+                        UPDATE competition_rounds cr
+                        SET winner_submission_id = (
+                            SELECT ss.id FROM speed_submissions ss
+                            WHERE ss.round_id = cr.id
+                              AND ss.is_baseline = TRUE
+                            ORDER BY ss.validated_tokens_per_sec DESC NULLS LAST
+                            LIMIT 1
+                        )
+                        WHERE cr.status = 'completed'
+                          AND cr.winner_hotkey IS NOT NULL
+                          AND cr.winner_submission_id IS NULL
+                    """)
+                )
+                conn.commit()
             result = conn.execute(text("""
                 SELECT column_name FROM information_schema.columns
                 WHERE table_name = 'miner_scores'
@@ -702,6 +725,13 @@ try:
                     conn.execute(
                         text(
                             "ALTER TABLE competition_rounds ADD COLUMN network TEXT DEFAULT 'finney'"
+                        )
+                    )
+                    conn.commit()
+                if "winner_submission_id" not in cr_cols:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE competition_rounds ADD COLUMN winner_submission_id INTEGER REFERENCES speed_submissions(id)"
                         )
                     )
                     conn.commit()
@@ -2842,36 +2872,7 @@ def get_weights(
             winner_hotkey=round_obj.winner_hotkey,
         )
 
-    # Calculate rankings with first-submission-wins logic
-    # Note: baseline_submission_id on a round is the baseline for the NEXT round
-    # When calculating weights for a round, we need the baseline that was active DURING that round
-    # For the first round (lowest round_number): no baseline (None)
-    # For subsequent rounds: use previous round's baseline_submission_id
-
-    # Find the first round (lowest round_number) for this network
-    first_round = (
-        db.query(models.CompetitionRound)
-        .filter(models.CompetitionRound.network == round_obj.network)
-        .order_by(models.CompetitionRound.round_number.asc())
-        .first()
-    )
-
-    if first_round and round_obj.round_number == first_round.round_number:
-        # This is the first round - no baseline
-        baseline_id = None
-    else:
-        # Get previous round's baseline (same network)
-        prev_round = (
-            db.query(models.CompetitionRound)
-            .filter(
-                models.CompetitionRound.network == round_obj.network,
-                models.CompetitionRound.round_number
-                == round_obj.round_number - 1,
-            )
-            .first()
-        )
-        baseline_id = prev_round.baseline_submission_id if prev_round else None
-
+    baseline_id = _resolve_baseline_for_round(round_obj, db)
     rankings = calculate_rankings(submissions, baseline_id, db)
 
     if not rankings:
@@ -2970,13 +2971,12 @@ def _finalize_round_impl(round_obj, db):
         round_obj.status = "completed"
         db.commit()
         return
-    rankings = calculate_rankings(
-        submissions, round_obj.baseline_submission_id, db
-    )
+    baseline_id = _resolve_baseline_for_round(round_obj, db)
+    rankings = calculate_rankings(submissions, baseline_id, db)
     if rankings:
         winner = rankings[0]
         round_obj.winner_hotkey = winner["miner_hotkey"]
-        round_obj.baseline_submission_id = winner["submission_id"]
+        round_obj.winner_submission_id = winner["submission_id"]
         db.commit()
         winner_submission = (
             db.query(models.SpeedSubmission)
@@ -2987,7 +2987,7 @@ def _finalize_round_impl(round_obj, db):
             winner_submission.is_baseline = True
             db.commit()
         print(
-            f"✅ [FINALIZE] Round {round_obj.round_number} winner: {round_obj.winner_hotkey}"
+            f"✅ [FINALIZE] Round {round_obj.round_number} winner: {round_obj.winner_hotkey} (submission {winner['submission_id']})"
         )
     else:
         print(
@@ -3030,12 +3030,16 @@ def ensure_current_round(db, network: Optional[str] = None):
             .first()
         )
         next_round_number = (last_round.round_number + 1) if last_round else 1
+        new_baseline_id = None
+        if last_round and getattr(last_round, "winner_submission_id", None):
+            new_baseline_id = last_round.winner_submission_id
         current_round = models.CompetitionRound(
             round_number=next_round_number,
             network=network,
             start_time=now,
             end_time=now + timedelta(hours=48),
             status="active",
+            baseline_submission_id=new_baseline_id,
         )
         db.add(current_round)
         try:
@@ -3239,6 +3243,36 @@ def create_round(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error creating round: {str(e)}",
         )
+
+
+def _resolve_baseline_for_round(round_obj, db) -> Optional[int]:
+    """Return the correct baseline_submission_id to use when ranking a round.
+
+    For the very first round on a network there is no baseline.  For later
+    rounds, the baseline is the *previous* round's winner submission — NOT
+    the current round's ``baseline_submission_id`` (which may have been
+    overwritten by an older code path).
+    """
+    first_round = (
+        db.query(models.CompetitionRound)
+        .filter(models.CompetitionRound.network == round_obj.network)
+        .order_by(models.CompetitionRound.round_number.asc())
+        .first()
+    )
+    if first_round and round_obj.round_number == first_round.round_number:
+        return None
+
+    prev_round = (
+        db.query(models.CompetitionRound)
+        .filter(
+            models.CompetitionRound.network == round_obj.network,
+            models.CompetitionRound.round_number == round_obj.round_number - 1,
+        )
+        .first()
+    )
+    if prev_round:
+        return getattr(prev_round, "winner_submission_id", None) or prev_round.baseline_submission_id
+    return None
 
 
 def calculate_rankings(
@@ -3472,18 +3506,17 @@ def finalize_round(
         return {"status": "completed", "winners": []}
 
     # Calculate rankings (with first-submission-wins logic)
-    rankings = calculate_rankings(
-        submissions, round_obj.baseline_submission_id, db
-    )
+    baseline_id = _resolve_baseline_for_round(round_obj, db)
+    rankings = calculate_rankings(submissions, baseline_id, db)
 
-    # Update round with winner
+    # Update round with winner (don't overwrite baseline_submission_id —
+    # that field records the baseline this round was judged against)
     if rankings:
         winner = rankings[0]
         round_obj.winner_hotkey = winner["miner_hotkey"]
-        round_obj.baseline_submission_id = winner["submission_id"]
+        round_obj.winner_submission_id = winner["submission_id"]
         db.commit()
 
-        # Mark winning submission as baseline for next round
         winner_submission = (
             db.query(models.SpeedSubmission)
             .filter(models.SpeedSubmission.id == winner["submission_id"])
@@ -3627,9 +3660,8 @@ def refinalize_round(
         }
 
     # Calculate rankings
-    rankings = calculate_rankings(
-        submissions, round_obj.baseline_submission_id, db
-    )
+    baseline_id = _resolve_baseline_for_round(round_obj, db)
+    rankings = calculate_rankings(submissions, baseline_id, db)
 
     if not rankings:
         # Check why rankings are empty
@@ -3654,13 +3686,13 @@ def refinalize_round(
             },
         }
 
-    # Set winner
+    # Set winner (don't overwrite baseline_submission_id —
+    # that field records the baseline this round was judged against)
     winner = rankings[0]
     round_obj.winner_hotkey = winner["miner_hotkey"]
-    round_obj.baseline_submission_id = winner["submission_id"]
+    round_obj.winner_submission_id = winner["submission_id"]
     db.commit()
 
-    # Mark winning submission as baseline for next round
     winner_submission = (
         db.query(models.SpeedSubmission)
         .filter(models.SpeedSubmission.id == winner["submission_id"])
@@ -3830,9 +3862,8 @@ def dashboard_leaderboard(
         .all()
     )
 
-    rankings = calculate_rankings(
-        all_submissions, round_obj.baseline_submission_id, db
-    )
+    baseline_id = _resolve_baseline_for_round(round_obj, db)
+    rankings = calculate_rankings(all_submissions, baseline_id, db)
     ranked_hotkeys = {entry["miner_hotkey"] for entry in rankings}
 
     leaderboard = []
@@ -3924,9 +3955,8 @@ def dashboard_top_miners(
         .all()
     )
 
-    rankings = calculate_rankings(
-        submissions, round_obj.baseline_submission_id, db
-    )
+    baseline_id = _resolve_baseline_for_round(round_obj, db)
+    rankings = calculate_rankings(submissions, baseline_id, db)
 
     top_miners = []
     for entry in rankings[:TOP_N_MINERS]:
