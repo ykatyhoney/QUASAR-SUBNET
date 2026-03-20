@@ -2050,7 +2050,7 @@ def mark_validated(
     actual_tps = req.get("actual_tokens_per_sec")
     if actual_tps is not None:
         actual_tps = float(actual_tps)
-        if actual_tps < MIN_PLAUSIBLE_TPS or actual_tps > MAX_PLAUSIBLE_TPS:
+        if actual_tps > 0 and (actual_tps < MIN_PLAUSIBLE_TPS or actual_tps > MAX_PLAUSIBLE_TPS):
             raise HTTPException(
                 status_code=400,
                 detail=f"actual_tokens_per_sec={actual_tps:.2f} is outside plausible range. "
@@ -2279,7 +2279,7 @@ def mark_validated_with_verification(
     actual_tps = req.get("actual_tokens_per_sec")
     if actual_tps is not None:
         actual_tps = float(actual_tps)
-        if actual_tps < MIN_PLAUSIBLE_TPS or actual_tps > MAX_PLAUSIBLE_TPS:
+        if actual_tps > 0 and (actual_tps < MIN_PLAUSIBLE_TPS or actual_tps > MAX_PLAUSIBLE_TPS):
             raise HTTPException(
                 status_code=400,
                 detail=f"actual_tokens_per_sec={actual_tps:.2f} outside plausible range.",
