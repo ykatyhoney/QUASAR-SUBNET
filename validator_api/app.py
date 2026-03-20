@@ -2083,15 +2083,17 @@ def mark_validated(
             DISCREPANCY_ABS_THRESHOLD = float(
                 os.environ.get("DISCREPANCY_ABS_THRESHOLD", "1000.0")
             )  # 1000 tok/s minimum
-
+            
+            miner_overclaimed = old_tps > actual_tps
             should_flag = (
-                discrepancy_pct > DISCREPANCY_PCT_THRESHOLD
+                miner_overclaimed
+                and discrepancy_pct > DISCREPANCY_PCT_THRESHOLD
                 and discrepancy_abs > DISCREPANCY_ABS_THRESHOLD
             )
 
             if should_flag:
                 print(
-                    f"🚨 [MARK_VALIDATED] TPS MISMATCH for {submission.miner_hotkey[:12]}...: "
+                    f"🚨 [MARK_VALIDATED] TPS OVER-CLAIM for {submission.miner_hotkey[:12]}...: "
                     f"claimed={old_tps:.2f}, actual={actual_tps:.2f} "
                     f"(diff: {discrepancy_pct:.1f}%, abs: {discrepancy_abs:.0f} tok/s)"
                 )
@@ -2335,12 +2337,14 @@ def mark_validated_with_verification(
                 os.environ.get("DISCREPANCY_ABS_THRESHOLD", "1000.0")
             )
 
+            miner_overclaimed = old_tps > actual_tps
             if (
-                discrepancy_pct > DISCREPANCY_PCT_THRESHOLD
+                miner_overclaimed
+                and discrepancy_pct > DISCREPANCY_PCT_THRESHOLD
                 and discrepancy_abs > DISCREPANCY_ABS_THRESHOLD
             ):
                 print(
-                    f"🚨 [MARK_VALIDATED] TPS MISMATCH for {submission.miner_hotkey[:12]}...: "
+                    f"🚨 [MARK_VALIDATED] TPS OVER-CLAIM for {submission.miner_hotkey[:12]}...: "
                     f"claimed={old_tps:.2f}, actual={actual_tps:.2f}"
                 )
                 miner_reg = (
@@ -2359,7 +2363,7 @@ def mark_validated_with_verification(
                 if miner_reg and not miner_reg.is_flagged:
                     miner_reg.is_flagged = True
                     miner_reg.flag_reason = (
-                        f"Large TPS discrepancy: claimed {old_tps:.0f}, actual {actual_tps:.0f} "
+                        f"TPS over-claim: claimed {old_tps:.0f}, actual {actual_tps:.0f} "
                         f"(diff: {discrepancy_pct:.1f}%, abs: {discrepancy_abs:.0f})"
                     )
 
