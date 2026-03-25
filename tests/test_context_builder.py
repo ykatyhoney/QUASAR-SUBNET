@@ -75,7 +75,7 @@ def test_full_context():
         assert "QUASAR FULL REPOSITORY CONTEXT" in context
         assert "chunk.py" in context
         assert "chunk_quasar" in context
-        assert "STRICT INSTRUCTIONS" in context
+        assert "KEY REQUIREMENTS" in context
         
         tokens = estimate_context_tokens(context)
         assert tokens > 0
