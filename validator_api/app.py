@@ -2811,7 +2811,8 @@ def get_weights(
     Args:
         round_id: Optional round ID. If not specified, uses the most recent completed round.
         network: "finney" (mainnet) or "test" (testnet). Default finney.
-        completed_only: If True and round_id not specified, only use a completed round (never active). Default True.
+        completed_only: If True and round_id not specified, prefer a completed round.
+            When False, also consider the active round for interim weight data.
     """
     network = normalize_network(network)
     if round_id is None:
@@ -2832,7 +2833,8 @@ def get_weights(
             )
             if round_obj:
                 print(
-                    f"[WEIGHTS] No completed round yet, using active round {round_obj.round_number} for network={network}"
+                    f"[WEIGHTS] No completed round, using active round "
+                    f"{round_obj.round_number} for network={network}"
                 )
     else:
         round_obj = (
@@ -2855,13 +2857,44 @@ def get_weights(
             winner_hotkey=None,
         )
 
-    # Get all validated submissions for this round
-    submissions = (
-        db.query(models.SpeedSubmission)
-        .filter(models.SpeedSubmission.round_id == round_obj.id)
-        .filter(models.SpeedSubmission.validated == True)
-        .all()
-    )
+    def _try_round(r):
+        """Attempt to compute rankings for a given round. Returns (submissions, rankings) or ([], [])."""
+        subs = (
+            db.query(models.SpeedSubmission)
+            .filter(models.SpeedSubmission.round_id == r.id)
+            .filter(models.SpeedSubmission.validated == True)
+            .all()
+        )
+        if not subs:
+            return [], []
+        bid = _resolve_baseline_for_round(r, db)
+        rnk = calculate_rankings(subs, bid, db)
+        return subs, rnk
+
+    submissions, rankings = _try_round(round_obj)
+
+    # Fallback: if the chosen round has no usable data AND the caller opted
+    # into active-round data, try the current active round as a secondary
+    # source. This ensures validators always have *something* to commit
+    # during the 48-hour window before a round completes.
+    if not rankings and not completed_only and round_obj.status == "completed":
+        active_round = (
+            db.query(models.CompetitionRound)
+            .filter(models.CompetitionRound.network == network)
+            .filter(models.CompetitionRound.status == "active")
+            .order_by(models.CompetitionRound.round_number.desc())
+            .first()
+        )
+        if active_round:
+            print(
+                f"[WEIGHTS] Completed round {round_obj.round_number} has no rankings, "
+                f"falling back to active round {active_round.round_number}"
+            )
+            active_subs, active_rankings = _try_round(active_round)
+            if active_rankings:
+                round_obj = active_round
+                submissions = active_subs
+                rankings = active_rankings
 
     if not submissions:
         print(
@@ -2875,9 +2908,6 @@ def get_weights(
             round_status=round_obj.status,
             winner_hotkey=round_obj.winner_hotkey,
         )
-
-    baseline_id = _resolve_baseline_for_round(round_obj, db)
-    rankings = calculate_rankings(submissions, baseline_id, db)
 
     if not rankings:
         print(

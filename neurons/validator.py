@@ -986,6 +986,19 @@ class Validator(BaseValidatorNeuron):
         self.scores = np.zeros(self.metagraph.n, dtype=np.float32)
         self.load_state()
 
+        # Weight commit interval in seconds
+        self.WEIGHT_COMMIT_INTERVAL = (
+            int(os.getenv("WEIGHT_COMMIT_INTERVAL_HOURS", "6")) * 3600
+        )
+        self._last_valid_scores = None
+        self._last_weight_commit_time = 0.0
+        self._cached_round_id = None
+        self._committed_round_id = None
+
+        bt.logging.info(
+            f"⏱️ Weight commit interval: {self.WEIGHT_COMMIT_INTERVAL // 3600}h "
+            f"(WEIGHT_COMMIT_INTERVAL_HOURS env var)"
+        )
         bt.logging.info(f"📡 Validator API URL: {VALIDATOR_API_URL}")
 
     def _api_auth_headers(self) -> Dict[str, str]:
@@ -2227,10 +2240,16 @@ class Validator(BaseValidatorNeuron):
             except Exception as e:
                 print(f"[VALIDATOR] ⚠️ Round check failed: {e}", flush=True)
 
-            # Fetch weights from API and update self.scores for on-chain submission
+            # ── Fetch weights from API + interim weight commits ──
+            #   1. Fetch latest weights from API (completed round → active round fallback)
+            #   2. Cache any valid weights received
+            #   3. Re-commit cached weights every WEIGHT_COMMIT_INTERVAL
+            net = getattr(self.subtensor, "network", None) or "finney"
+            network = "test" if str(net).lower() == "test" else "finney"
+
+            fresh_weight_entries = []
+            fresh_round_id = None
             try:
-                net = getattr(self.subtensor, "network", None) or "finney"
-                network = "test" if str(net).lower() == "test" else "finney"
                 response = requests.get(
                     f"{VALIDATOR_API_URL}/get_weights",
                     params={"network": network},
@@ -2239,82 +2258,154 @@ class Validator(BaseValidatorNeuron):
                 )
                 if response.status_code == 200:
                     weights_data = response.json()
-                    weight_entries = weights_data.get("weights", [])
-
-                    if weight_entries:
-                        # Build hotkey -> UID mapping from metagraph (the authoritative source)
-                        hotkey_to_uid = {}
-                        for uid_idx in range(self.metagraph.n):
-                            hk = self.metagraph.hotkeys[uid_idx]
-                            hotkey_to_uid[hk] = uid_idx
-
-                        # Reset scores to zero, then populate from API weights
-                        self.scores = np.zeros(
-                            self.metagraph.n, dtype=np.float32
-                        )
-                        resolved_count = 0
-
-                        for entry in weight_entries:
-                            hotkey = entry.get("hotkey", "")
-                            weight = entry.get("weight", 0.0)
-
-                            if hotkey in hotkey_to_uid:
-                                uid = hotkey_to_uid[hotkey]
-                                self.scores[uid] = float(weight)
-                                resolved_count += 1
-                                print(
-                                    f"[VALIDATOR]   UID {uid} ({hotkey[:12]}...): weight={weight:.4f}",
-                                    flush=True,
-                                )
-                            else:
-                                print(
-                                    f"[VALIDATOR] ⚠️ Hotkey {hotkey[:12]}... not found in metagraph, skipping",
-                                    flush=True,
-                                )
-
-                        if resolved_count > 0:
-                            print(
-                                f"[VALIDATOR] 📊 Updated self.scores for {resolved_count} miners from API weights",
-                                flush=True,
-                            )
-                            bt.logging.info(
-                                f"Updated scores for {resolved_count} miners, calling set_weights()"
-                            )
-                            self.save_state()
-                            success = self.set_weights()
-                            if success:
-                                print(
-                                    f"[VALIDATOR] ✅ Weights successfully set on Bittensor chain",
-                                    flush=True,
-                                )
-                                bt.logging.success(
-                                    f"✅ Weights submitted to Bittensor chain"
-                                )
-                            else:
-                                # Error message already printed in set_weights() method
-                                print(
-                                    f"[VALIDATOR] ⚠️ Weight setting failed - will retry in next cycle",
-                                    flush=True,
-                                )
-                                bt.logging.warning(
-                                    f"⚠️ Weight setting failed - will retry in next cycle"
-                                )
-                        else:
-                            print(
-                                f"[VALIDATOR] ⚠️ No miners from API weights found in metagraph",
-                                flush=True,
-                            )
-                    else:
+                    fresh_weight_entries = weights_data.get("weights", [])
+                    fresh_round_id = weights_data.get("round_id")
+                    if not fresh_weight_entries:
                         print(
-                            f"[VALIDATOR] ⚠️ No weights available yet from API",
+                            "[VALIDATOR] ⚠️ API returned empty weights (completed round), "
+                            "trying active round...",
                             flush=True,
                         )
+                        response = requests.get(
+                            f"{VALIDATOR_API_URL}/get_weights",
+                            params={
+                                "network": network,
+                                "completed_only": "false",
+                            },
+                            headers=self._api_auth_headers(),
+                            timeout=10,
+                        )
+                        if response.status_code == 200:
+                            weights_data = response.json()
+                            fresh_weight_entries = weights_data.get(
+                                "weights", []
+                            )
+                            fresh_round_id = weights_data.get("round_id")
+                            if fresh_weight_entries:
+                                print(
+                                    f"[VALIDATOR] 📊 Got interim weights from active round {weights_data.get('round_number')}",
+                                    flush=True,
+                                )
             except Exception as e:
                 print(
-                    f"[VALIDATOR] ⚠️ Weight fetching/submission failed: {e}",
+                    f"[VALIDATOR] ⚠️ Weight fetch failed: {e}",
                     flush=True,
                 )
-                bt.logging.warning(f"Weight submission failed: {e}")
+                bt.logging.warning(f"Weight fetch failed: {e}")
+
+            # Resolve API weight entries → scores array
+            if fresh_weight_entries:
+                hotkey_to_uid = {}
+                for uid_idx in range(self.metagraph.n):
+                    hk = self.metagraph.hotkeys[uid_idx]
+                    hotkey_to_uid[hk] = uid_idx
+
+                new_scores = np.zeros(self.metagraph.n, dtype=np.float32)
+                resolved_count = 0
+                for entry in fresh_weight_entries:
+                    hotkey = entry.get("hotkey", "")
+                    weight = entry.get("weight", 0.0)
+                    if hotkey in hotkey_to_uid:
+                        uid = hotkey_to_uid[hotkey]
+                        new_scores[uid] = float(weight)
+                        resolved_count += 1
+                        print(
+                            f"[VALIDATOR]   UID {uid} ({hotkey[:12]}...): weight={weight:.4f}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[VALIDATOR] ⚠️ Hotkey {hotkey[:12]}... not in metagraph, skipping",
+                            flush=True,
+                        )
+
+                if resolved_count > 0:
+                    self.scores = new_scores
+                    self._last_valid_scores = new_scores.copy()
+                    self._cached_round_id = fresh_round_id
+                    print(
+                        f"[VALIDATOR] 📊 Updated scores for {resolved_count} miners "
+                        f"(round_id={fresh_round_id})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[VALIDATOR] ⚠️ No API miners found in metagraph",
+                        flush=True,
+                    )
+
+            # ── Decide whether to commit weights this cycle ──
+            # Commit triggers:
+            #   1. Never committed before (first run)
+            #   2. New round data (round just completed → fresh rankings)
+            #   3. Interval elapsed (repeat cached weights to stay active)
+            now_ts = time.time()
+            time_since_last_commit = now_ts - self._last_weight_commit_time
+            never_committed = self._last_weight_commit_time == 0
+            new_round = (
+                self._cached_round_id is not None
+                and self._cached_round_id != self._committed_round_id
+            )
+            interval_elapsed = (
+                time_since_last_commit >= self.WEIGHT_COMMIT_INTERVAL
+            )
+
+            has_current_scores = np.any(self.scores > 0)
+            has_cached_scores = (
+                self._last_valid_scores is not None
+                and np.any(self._last_valid_scores > 0)
+            )
+            has_any_weights = has_current_scores or has_cached_scores
+
+            should_commit = has_any_weights and (
+                never_committed or new_round or interval_elapsed
+            )
+
+            if should_commit:
+                if not has_current_scores and has_cached_scores:
+                    self.scores = self._last_valid_scores.copy()
+
+                reason = (
+                    "first commit" if never_committed
+                    else f"new round {self._cached_round_id}" if new_round
+                    else f"interval ({self.WEIGHT_COMMIT_INTERVAL // 3600}h)"
+                )
+                hours_since = time_since_last_commit / 3600
+                print(
+                    f"[VALIDATOR] ⏰ Committing weights — reason: {reason} "
+                    f"(last commit: {hours_since:.1f}h ago)",
+                    flush=True,
+                )
+                self.save_state()
+                success = self.set_weights()
+                if success:
+                    self._last_weight_commit_time = now_ts
+                    self._committed_round_id = self._cached_round_id
+                    print(
+                        "[VALIDATOR] ✅ Weights committed on chain",
+                        flush=True,
+                    )
+                    bt.logging.success("Weights committed on chain")
+                else:
+                    print(
+                        "[VALIDATOR] ⚠️ Weight commit failed — will retry next cycle",
+                        flush=True,
+                    )
+                    bt.logging.warning("Weight commit failed — will retry")
+            elif has_any_weights:
+                next_commit_in = (
+                    self.WEIGHT_COMMIT_INTERVAL - time_since_last_commit
+                )
+                print(
+                    f"[VALIDATOR] ⏱️ Next weight commit in {next_commit_in / 3600:.1f}h "
+                    f"(cached round_id={self._cached_round_id})",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[VALIDATOR] ⚠️ No weights to commit (no API data and no cache)",
+                    flush=True,
+                )
 
             # Wait before next cycle using dynamic interval
             print(
