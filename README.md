@@ -113,9 +113,12 @@ This runs `neurons/validator.py` which, on each cycle:
 
 1. Syncs metagraph UIDs with the Validator API
 2. Fetches pending submissions and validates them (clone repo, benchmark in sandbox, verify logits)
-3. Pulls competition weights from `/get_weights`
-4. Sets weights on the Bittensor chain via `set_weights()`
-5. Sleeps for the polling interval (default 300s) and repeats
+3. Pulls competition weights from `/get_weights` (completed round or active round interim data)
+4. Caches received weights locally
+5. Commits weights on-chain every **6 hours** (configurable via `WEIGHT_COMMIT_INTERVAL_HOURS`)
+6. Sleeps for the polling interval (default 300s) and repeats
+
+**Interim weight commits**: Bittensor's `activity_cutoff` (~5000 blocks / ~16.7h) requires validators to set weights regularly. Since competition rounds last 48 hours, the validator automatically re-commits the last valid weights every 6 hours to stay active. Weights are committed immediately when a new round completes, and then repeated on the 6-hour cadence until the next round finishes.
 
 The validator needs its hotkey to be authorized on the Validator API. Contact the subnet owner to have your hotkey added to the production `VALIDATOR_HOTKEYS`.
 
@@ -220,7 +223,7 @@ from fla.utils import input_guard
 
 ## Reward Distribution
 
-Competition runs in **48-hour rounds**. At the end of each round, submissions are ranked by **validator-measured TPS** (not miner-claimed). The top 4 submissions receive rewards:
+Competition runs in **48-hour evaluation rounds**. During each round, validators independently benchmark and verify miner submissions. Ranking is based on **validator-measured TPS** (not miner-claimed). The top 4 submissions receive rewards:
 
 | Rank | Reward Share |
 |:----:|:-----------:|
@@ -243,7 +246,23 @@ Competition runs in **48-hour rounds**. At the end of each round, submissions ar
 | ≤ 500K | 500k | 1.5× |
 | ≤ 1M | 1M | 3.0× |
 
-Validators set these weights on-chain. The Bittensor network distributes emissions proportionally to the weights set by staked validators.
+### Weight Commit Cadence
+
+While evaluation rounds last 48 hours, validators **commit weights on-chain every 6 hours** to stay within Bittensor's `activity_cutoff` (5000 blocks / ~16.7h):
+
+```
+Round N completes  ─► commit Round N weights (immediate)
+      +6h          ─► re-commit Round N weights
+      +12h         ─► re-commit Round N weights
+      ...
+      +48h         ─► Round N+1 completes ─► commit Round N+1 weights
+```
+
+This ensures validators remain `ACTIVE` in the metagraph at all times. If the API is temporarily unreachable, the validator repeats its last cached weights. The interval is configurable via `WEIGHT_COMMIT_INTERVAL_HOURS` (default `6`).
+
+### GPU Normalization in Scoring
+
+Since validators and miners run on different GPUs, raw TPS values differ across hardware. Validator-measured TPS is **normalized to a reference GPU baseline** (RTX 5090) so that rankings are hardware-independent. The miner's self-reported TPS is informational only — ranking is entirely based on what the validator measures and normalizes.
 
 ---
 
@@ -264,7 +283,7 @@ Validators set these weights on-chain. The Bittensor network distributes emissio
 
 - **Validator API** (`validator_api/app.py`): Central FastAPI service managing rounds, submissions, rankings, and weights. Deployed on Render with PostgreSQL.
 - **Miner Neuron** (`neurons/miner.py`): Optimizes kernels, benchmarks locally, submits to API.
-- **Validator Neuron** (`neurons/validator.py`): Validates submissions in Docker sandbox, verifies logits, pulls weights from API, sets weights on-chain.
+- **Validator Neuron** (`neurons/validator.py`): Validates submissions in Docker sandbox, verifies logits, pulls weights from API, and commits weights on-chain every 6 hours (interim repeat-weights to stay within activity_cutoff).
 - **Miner Inference Server** (`miner/inference_server.py`): HTTP server for logit verification (`POST /inference`, `GET /health`).
 
 ---
@@ -286,6 +305,7 @@ Validators set these weights on-chain. The Bittensor network distributes emissio
 | `ENABLE_LOGIT_VERIFICATION` | `true` | Validator | Must be `true` for production |
 | `REFERENCE_MODEL` | `Qwen/Qwen3-4B-Instruct-2507` | Validator | Model for logit comparison |
 | `POLLING_INTERVAL` | `300` | Validator | Seconds between validation cycles |
+| `WEIGHT_COMMIT_INTERVAL_HOURS` | `6` | Validator | Hours between on-chain weight commits (keep under ~16h) |
 | `GPU_NORMALIZATION_FACTOR` | auto | Validator | Override auto-detected GPU factor |
 
 See `.env.example` for the full list with documentation.
@@ -319,13 +339,14 @@ Override with `GPU_NORMALIZATION_FACTOR` in `.env`.
 
 | Provider | Miner | Validator | Notes |
 |---|:---:|:---:|---|
+| **Targon (SN4)** | ✅ | ✅* | Requires containerd fix — see [Troubleshooting](./docs/TROUBLESHOOTING.md#targon-docker-unsupported-shim-version-error) |
 | **RunPod** | ✅ | ❌ | No Docker daemon — miners use Bazel for image push |
 | **Vast.ai** | ✅ | ✅ | Full Docker; sync clock with NTP |
 | **Lambda Labs** | ✅ | ✅ | Full Docker and GPU support |
 | **AWS EC2** | ✅ | ✅ | Full VM with Docker |
 | **GCP GPU VMs** | ✅ | ✅ | Full VM with Docker |
 
-Validators **require** `docker run` for sandbox benchmarking. RunPod does not support this.
+Validators **require** `docker run` for sandbox benchmarking. RunPod does not support this. Targon VMs support Docker but need a one-time containerd version fix.
 
 ### Ports
 

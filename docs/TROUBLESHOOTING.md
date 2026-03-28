@@ -6,6 +6,7 @@ Common issues and solutions for running QUASAR-SUBNET miners and validators.
 
 ## Table of Contents
 
+- [Targon: Docker "Unsupported Shim Version" Error](#targon-docker-unsupported-shim-version-error)
 - [RunPod: Docker Not Available](#runpod-docker-not-available)
 - [Vast.ai: Clock Drift Causing 401 Errors](#vastai-clock-drift-causing-401-errors)
 - [Vast.ai: GPU Not Found in Docker Containers](#vastai-gpu-not-found-in-docker-containers)
@@ -16,6 +17,91 @@ Common issues and solutions for running QUASAR-SUBNET miners and validators.
 - [Miner: Bazel Push Authentication Failed](#miner-bazel-push-authentication-failed)
 - [Validator: GPU Normalization Factor Not Detected](#validator-gpu-normalization-factor-not-detected)
 - [General: Port Already in Use](#general-port-already-in-use)
+
+---
+
+## Targon: Docker "Unsupported Shim Version" Error
+
+**Symptoms:**
+
+```
+docker: Error response from daemon: failed to create task for container: Unimplemented:
+  failed to start shim: start failed: unsupported shim version (3): not implemented
+```
+
+**Cause:** Targon (Subnet 4) provisions machines as Kubernetes pods. The host node runs containerd v2.x as the Kubernetes CRI, which ships shim binaries that speak API version 3. Docker inside the pod bundles its own containerd v1.7.x, which only understands shim API version 2. When Docker tries to start a container, it invokes the system's `containerd-shim-runc-v2` binary (v2.x/v3 protocol) but Docker's embedded containerd daemon (v1.7) can't communicate with it.
+
+**Diagnosis:**
+
+```bash
+# Check Docker's bundled containerd version
+docker info 2>/dev/null | grep -i containerd
+
+# Check the system containerd binary version
+containerd --version
+
+# Check which shim binaries are installed
+ls -la /usr/bin/containerd-shim*
+
+# Check installed package versions
+dpkg -l | grep -E 'containerd|docker'
+```
+
+If `containerd --version` shows `2.0.x` but `docker info` shows containerd `1.7.x`, you have the version mismatch.
+
+**Fix — Option 1: Downgrade system containerd (most reliable)**
+
+```bash
+# Pin containerd.io to a v1.7.x release compatible with Docker's embedded version
+apt-get update
+apt-get install -y containerd.io=1.7.24-1 || apt-get install -y containerd.io=1.7.22-1
+
+# Restart Docker (it will pick up the compatible shim binaries)
+systemctl restart docker
+
+# Verify
+docker run --rm --gpus all nvidia/cuda:12.1.0-runtime-ubuntu22.04 nvidia-smi
+```
+
+If the exact version isn't available, list what's available:
+
+```bash
+apt-cache madison containerd.io | grep 1.7
+```
+
+**Fix — Option 2: Upgrade Docker CE to latest (ships compatible containerd)**
+
+```bash
+# Add Docker's official repo if not present
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io
+
+# Reconfigure NVIDIA runtime (upgrade may overwrite daemon.json)
+nvidia-ctk runtime configure --runtime=docker
+systemctl restart docker
+
+# Verify
+docker run --rm --gpus all nvidia/cuda:12.1.0-runtime-ubuntu22.04 nvidia-smi
+```
+
+**Fix — Option 3: Restart containerd service (sometimes sufficient)**
+
+```bash
+systemctl restart containerd
+systemctl restart docker
+docker run --rm --gpus all nvidia/cuda:12.1.0-runtime-ubuntu22.04 nvidia-smi
+```
+
+This works if containerd v2.x was upgraded but the daemon wasn't restarted, so the running daemon is stale v1.7 code that can't handle v3 shim protocol.
+
+**After fixing Docker**, build the sandbox image and continue setup:
+
+```bash
+docker build -t quasar-sandbox:latest -f validator/Dockerfile.sandbox .
+```
 
 ---
 
