@@ -339,14 +339,14 @@ Override with `GPU_NORMALIZATION_FACTOR` in `.env`.
 
 | Provider | Miner | Validator | Notes |
 |---|:---:|:---:|---|
-| **Targon (SN4)** | ✅ | ✅* | Requires containerd fix — see [Troubleshooting](./docs/TROUBLESHOOTING.md#targon-docker-unsupported-shim-version-error) |
-| **RunPod** | ✅ | ❌ | No Docker daemon — miners use Bazel for image push |
 | **Vast.ai** | ✅ | ✅ | Full Docker; sync clock with NTP |
 | **Lambda Labs** | ✅ | ✅ | Full Docker and GPU support |
 | **AWS EC2** | ✅ | ✅ | Full VM with Docker |
 | **GCP GPU VMs** | ✅ | ✅ | Full VM with Docker |
+| **RunPod** | ✅ | ❌ | No Docker daemon — miners use Bazel for image push |
+| **Targon (SN4)** | ✅ | ❌ | Kubernetes pods lack full Docker support (containerd shim + docker-proxy issues) |
 
-Validators **require** `docker run` for sandbox benchmarking. RunPod does not support this. Targon VMs support Docker but need a one-time containerd version fix.
+Validators **require** `docker run` with GPU passthrough and port mapping for sandbox benchmarking and logit verification. RunPod and Targon do not fully support this — use Vast.ai, Lambda Labs, or a full VM provider instead.
 
 ### Ports
 
