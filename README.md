@@ -268,19 +268,6 @@ Since validators and miners run on different GPUs, raw TPS values differ across 
 
 ## Architecture
 
-```
-┌─────────────┐     submit      ┌──────────────────┐     get_weights     ┌───────────────┐
-│    Miner     │ ──────────────► │   Validator API   │ ◄────────────────── │   Validator    │
-│ neurons/     │                 │ validator_api/     │                     │ neurons/       │
-│ miner.py     │                 │ app.py            │ ──── set_weights ──►│ validator.py   │
-└─────────────┘                 └──────────────────┘      (on-chain)      └───────────────┘
-       │                                │                                         │
-       │ push docker image              │ PostgreSQL                              │ sandbox benchmark
-       ▼                                │ (Supabase)                              │ + logit verification
-  Docker Hub                            │                                         ▼
-                                        └───────────────────────────────── Docker sandbox
-```
-
 - **Validator API** (`validator_api/app.py`): Central FastAPI service managing rounds, submissions, rankings, and weights. Deployed on Render with PostgreSQL.
 - **Miner Neuron** (`neurons/miner.py`): Optimizes kernels, benchmarks locally, submits to API.
 - **Validator Neuron** (`neurons/validator.py`): Validates submissions in Docker sandbox, verifies logits, pulls weights from API, and commits weights on-chain every 6 hours (interim repeat-weights to stay within activity_cutoff).
